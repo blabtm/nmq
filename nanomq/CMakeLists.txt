@@ -4,7 +4,7 @@
 # (LICENSE.txt).  A copy of the license may also be found online at
 # https://opensource.org/licenses/MIT.
 
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.11)
 
 project(nanomq)
 SET(CMAKE_C_STANDARD 99)
@@ -50,6 +50,7 @@ set(SOURCES
     cmd_proc.c
     acl_handler.c
     mqtt_api.c
+    vcas_api.c
     nanomq.c
     apps/broker.c
 )

@@ -5,7 +5,7 @@
 # found online at https://opensource.org/licenses/MIT.
 # not finished yet #
 
-cmake_minimum_required (VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.11)
 SET(CMAKE_C_STANDARD 99)
 
 project(nanomq-nng)
@@ -16,6 +16,9 @@ set(CMAKE_MODULE_PATH
   ${CMAKE_MODULE_PATH}
   "${CMAKE_CURRENT_LIST_DIR}/cmake"
 )
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_BUILD_TYPE Debug)
 
 include(NanoMQHelpers)
 

@@ -7,61 +7,62 @@
 // found online at https://opensource.org/licenses/MIT.
 //
 #include <ctype.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <errno.h>
 
-#include "nng/mqtt/mqtt_client.h"
+#include "nng/nng.h"
+
 #include "nng/exchange/exchange_client.h"
+#include "nng/mqtt/mqtt_client.h"
+#include "nng/protocol/mqtt/mqtt_parser.h"
 #include "nng/protocol/mqtt/nmq_mqtt.h"
 #include "nng/protocol/pipeline0/pull.h"
 #include "nng/protocol/pipeline0/push.h"
 #include "nng/protocol/reqrep0/rep.h"
-#include "nng/protocol/mqtt/mqtt_parser.h"
-#include "nng/protocol/mqtt/nmq_mqtt.h"
-#include "nng/supplemental/tls/tls.h"
-#include "nng/supplemental/util/options.h"
-#include "nng/supplemental/util/platform.h"
-#include "nng/supplemental/sqlite/sqlite3.h"
+#include "nng/protocol/vcas/vcas.h"
 #include "nng/supplemental/nanolib/conf.h"
 #include "nng/supplemental/nanolib/env.h"
 #include "nng/supplemental/nanolib/file.h"
 #include "nng/supplemental/nanolib/hash_table.h"
-#include "nng/supplemental/nanolib/mqtt_db.h"
 #include "nng/supplemental/nanolib/log.h"
+#include "nng/supplemental/nanolib/mqtt_db.h"
 #include "nng/supplemental/nanolib/utils.h"
+#include "nng/supplemental/sqlite/sqlite3.h"
+#include "nng/supplemental/tls/tls.h"
+#include "nng/supplemental/util/options.h"
+#include "nng/supplemental/util/platform.h"
 
 #include "include/acl_handler.h"
 #include "include/bridge.h"
-#include "include/nanomq_rule.h"
+#include "include/cmd_proc.h"
 #include "include/mqtt_api.h"
 #include "include/nanomq.h"
+#include "include/nanomq_rule.h"
 #include "include/process.h"
 #include "include/pub_handler.h"
+#include "include/rest_api.h"
 #include "include/sub_handler.h"
 #include "include/unsub_handler.h"
+#include "include/vcas.h"
 #include "include/web_server.h"
-#include "include/rest_api.h"
-#include "include/webhook_post.h"
 #include "include/webhook_inproc.h"
-#include "include/cmd_proc.h"
-#include "include/process.h"
-#include "include/nanomq.h"
+#include "include/webhook_post.h"
 
 #if defined(SUPP_ICEORYX)
-	#include "nng/iceoryx_shm/iceoryx_shm.h"
+#include "nng/iceoryx_shm/iceoryx_shm.h"
 #endif
 
 #if defined(SUPP_PLUGIN)
-	#include "include/plugin.h"
+#include "include/plugin.h"
 #endif
 // #if defined(SUPP_RULE_ENGINE)
 // 	#include <foundationdb/fdb_c.h>
 // 	#include <foundationdb/fdb_c_options.g.h>
 // #endif
 #if defined(SUPP_AWS_BRIDGE)
-	#include "include/aws_bridge.h"
+#include "include/aws_bridge.h"
 #endif
 // Parallel is the maximum number of outstanding requests we can handle.
 // This is *NOT* the number of threads in use, but instead represents
@@ -95,15 +96,11 @@ static const int all_signals[] = {
 #ifdef SIGIO
 	SIGIO,
 #endif
-	SIGABRT,
-	SIGFPE,
-	SIGILL,
-	SIGINT,
-	SIGSEGV,
-	SIGTERM
+	SIGABRT, SIGFPE, SIGILL, SIGINT, SIGSEGV, SIGTERM
 };
 
-void sig_handler(int signum)
+void
+sig_handler(int signum)
 {
 	log_error("signal signumber: %d received!\n", signum);
 
@@ -118,8 +115,10 @@ void sig_handler(int signum)
 
 enum options {
 	OPT_HELP = 1,
-	OPT_HOCONFILE = 2, /* Do not change this value, it is used beyond this file. */
-	OPT_CONFFILE = 3,  /* Do not change this value, it is used beyond this file. */
+	OPT_HOCONFILE =
+	    2, /* Do not change this value, it is used beyond this file. */
+	OPT_CONFFILE =
+	    3, /* Do not change this value, it is used beyond this file. */
 	OPT_PARALLEL,
 	OPT_DAEMON,
 	OPT_THREADS,
@@ -200,67 +199,100 @@ static nng_optspec cmd_opts[] = {
 static inline void
 bridge_pub_handler(nano_work *work)
 {
-	int      rv    = 0;
-	property *props = NULL;
-	uint32_t  index = work->ctx.id - 1;
+	int          rv    = 0;
+	property    *props = NULL;
+	uint32_t     index = work->ctx.id - 1;
 	mqtt_string *topic;
 
 	// Or we just exclude all topic with $?
-	if ((work->pub_packet->var_header.publish.topic_name.len > strlen("$SYS")) &&
-		strncmp(work->pub_packet->var_header.publish.topic_name.body, "$SYS", strlen("$SYS")) == 0) {
+	if ((work->pub_packet->var_header.publish.topic_name.len >
+	        strlen("$SYS")) &&
+	    strncmp(work->pub_packet->var_header.publish.topic_name.body,
+	        "$SYS", strlen("$SYS")) == 0) {
 		return;
 	}
 	topic = nng_zalloc(sizeof(*topic));
 	for (size_t t = 0; t < work->config->bridge.count; t++) {
 		conf_bridge_node *node = work->config->bridge.nodes[t];
-		nng_mtx_lock(node->mtx);		//TODO bridge performance
+		nng_mtx_lock(node->mtx); // TODO bridge performance
 		if (node->enable) {
 			for (size_t i = 0; i < node->forwards_count; i++) {
-				rv = 0;
-				topic->body = work->pub_packet->var_header.publish.topic_name.body;
-				topic->len  = work->pub_packet->var_header.publish.topic_name.len;
-				if (topic_filter(node->forwards_list[i]->local_topic,
-							(const char *)topic->body)) {
+				rv          = 0;
+				topic->body = work->pub_packet->var_header
+				                  .publish.topic_name.body;
+				topic->len = work->pub_packet->var_header
+				                 .publish.topic_name.len;
+				if (topic_filter(
+				        node->forwards_list[i]->local_topic,
+				        (const char *) topic->body)) {
 					work->state = SEND;
 
 					nng_msg *bridge_msg = NULL;
-					if (work->proto_ver == MQTT_PROTOCOL_VERSION_v5 &&
-						node->proto_ver == MQTT_PROTOCOL_VERSION_v5) {
-						mqtt_property_dup(
-						    &props, work->pub_packet->var_header.publish.properties);
+					if (work->proto_ver ==
+					        MQTT_PROTOCOL_VERSION_v5 &&
+					    node->proto_ver ==
+					        MQTT_PROTOCOL_VERSION_v5) {
+						mqtt_property_dup(&props,
+						    work->pub_packet
+						        ->var_header.publish
+						        .properties);
 					}
 					// No change if remote topic == ""
-					if (node->forwards_list[i]->remote_topic_len != 0) {
-						topic->body = node->forwards_list[i]->remote_topic;
-						topic->len = node->forwards_list[i]->remote_topic_len;
-					}
-					if (node->forwards_list[i]->prefix != NULL) {
+					if (node->forwards_list[i]
+					        ->remote_topic_len != 0) {
 						topic->body =
-							nng_strnins(topic->body, node->forwards_list[i]->prefix,
-										topic->len, node->forwards_list[i]->prefix_len);
-						topic->len = strlen(topic->body);
-						rv = NNG_STAT_STRING;	//mark it for free
+						    node->forwards_list[i]
+						        ->remote_topic;
+						topic->len =
+						    node->forwards_list[i]
+						        ->remote_topic_len;
 					}
-					if (node->forwards_list[i]->suffix != NULL) {
+					if (node->forwards_list[i]->prefix !=
+					    NULL) {
+						topic->body =
+						    nng_strnins(topic->body,
+						        node->forwards_list[i]
+						            ->prefix,
+						        topic->len,
+						        node->forwards_list[i]
+						            ->prefix_len);
+						topic->len =
+						    strlen(topic->body);
+						rv = NNG_STAT_STRING; // mark
+						                      // it for
+						                      // free
+					}
+					if (node->forwards_list[i]->suffix !=
+					    NULL) {
 						char *tmp = topic->body;
 						topic->body =
-							nng_strncat(topic->body, node->forwards_list[i]->suffix,
-										topic->len, node->forwards_list[i]->suffix_len);
-						topic->len = strlen(topic->body);
+						    nng_strncat(topic->body,
+						        node->forwards_list[i]
+						            ->suffix,
+						        topic->len,
+						        node->forwards_list[i]
+						            ->suffix_len);
+						topic->len =
+						    strlen(topic->body);
 						if (rv == NNG_STAT_STRING)
-							nng_free(tmp, strlen(tmp));
+							nng_free(
+							    tmp, strlen(tmp));
 						else
-							rv = NNG_STAT_STRING;	//mark it for free
+							rv =
+							    NNG_STAT_STRING; // mark it for free
 					}
 					uint8_t retain;
 					uint8_t qos;
 					retain =
-					    node->forwards_list[i]->retain == NO_RETAIN
-					    ? work->pub_packet->fixed_header.retain
+					    node->forwards_list[i]->retain ==
+					        NO_RETAIN
+					    ? work->pub_packet->fixed_header
+					          .retain
 					    : node->forwards_list[i]->retain;
-					qos    =
-					    node->forwards_list[i]->qos == NO_QOS
-					    ? work->pub_packet->fixed_header.qos
+					qos = node->forwards_list[i]->qos ==
+					        NO_QOS
+					    ? work->pub_packet->fixed_header
+					          .qos
 					    : node->forwards_list[i]->qos;
 					bridge_msg = bridge_publish_msg(
 					    topic->body,
@@ -269,35 +301,53 @@ bridge_pub_handler(nano_work *work)
 					    work->pub_packet->fixed_header.dup,
 					    qos, retain, props);
 					if (rv == NNG_STAT_STRING) {
-						nng_free(topic->body,strlen(topic->body));
+						nng_free(topic->body,
+						    strlen(topic->body));
 					}
 
-					node->proto_ver == MQTT_PROTOCOL_VERSION_v5
+					node->proto_ver ==
+					        MQTT_PROTOCOL_VERSION_v5
 					    ? nng_mqttv5_msg_encode(bridge_msg)
 					    : nng_mqtt_msg_encode(bridge_msg);
 
 					nng_socket *socket = node->sock;
 
 					// what if send qos msg failed?
-					// nanosdk deal with fail send and close the pipe
-					if (nng_aio_busy(node->bridge_aio[index])) {
-						// still drop msg while reconnecting
-						if (nng_lmq_full(node->ctx_msgs) || qos == 0) {
-							nng_msg_free(bridge_msg);
+					// nanosdk deal with fail send and
+					// close the pipe
+					if (nng_aio_busy(
+					        node->bridge_aio[index])) {
+						// still drop msg while
+						// reconnecting
+						if (nng_lmq_full(
+						        node->ctx_msgs) ||
+						    qos == 0) {
+							nng_msg_free(
+							    bridge_msg);
 							log_warn(
-								"bridging to %s aio busy! "
-								"msg lost! Ctx: %d",
-								node->address, work->ctx.id);
+							    "bridging to %s "
+							    "aio busy! "
+							    "msg lost! Ctx: "
+							    "%d",
+							    node->address,
+							    work->ctx.id);
 						} else {
-							// pass index of aio via timestamp;
-							nng_lmq_put(node->ctx_msgs, bridge_msg);
+							// pass index of aio
+							// via timestamp;
+							nng_lmq_put(
+							    node->ctx_msgs,
+							    bridge_msg);
 						}
 					} else {
-						nng_aio_set_timeout(node->bridge_aio[index],
-											node->cancel_timeout);
-						nng_aio_set_msg(node->bridge_aio[index], bridge_msg);
+						nng_aio_set_timeout(
+						    node->bridge_aio[index],
+						    node->cancel_timeout);
+						nng_aio_set_msg(
+						    node->bridge_aio[index],
+						    bridge_msg);
 						// switch to nng_ctx_send!
-						nng_send_aio(*socket, node->bridge_aio[index]);
+						nng_send_aio(*socket,
+						    node->bridge_aio[index]);
 					}
 					rv = SUCCESS;
 				}
@@ -312,29 +362,33 @@ bridge_pub_handler(nano_work *work)
 void
 server_cb(void *arg)
 {
-	nano_work     *work = arg;
-	nng_msg       *msg  = NULL;
-	nng_msg       *smsg = NULL;
-	int            rv;
+	nano_work *work = arg;
+	nng_msg   *msg  = NULL;
+	nng_msg   *smsg = NULL;
+	int        rv;
 
 	mqtt_msg_info *msg_info;
 	nng_socket    *newsock = NULL;
 
 	switch (work->state) {
 	case INIT:
-		// log_debug("INIT ^^^^^^^^ ctx [%d] ^^^^^^^^ \n", work->ctx.id);
+		// log_debug("INIT ^^^^^^^^ ctx [%d] ^^^^^^^^ \n",
+		// work->ctx.id);
 		work->state = RECV;
 		if (work->proto == PROTO_MQTT_BROKER) {
-			log_debug("INIT ^^^^^^^^ ctx [%d] ^^^^^^^^ \n", work->ctx.id);
+			log_debug("INIT ^^^^^^^^ ctx [%d] ^^^^^^^^ \n",
+			    work->ctx.id);
 			nng_ctx_recv(work->ctx, work->aio);
 #if defined(SUPP_ICEORYX)
 		} else if (work->proto == PROTO_ICEORYX_BRIDGE) {
-			log_debug("INIT ^^^^^^^^ iceoryx ctx [%d] ^^^^^^^^ \n", work->extra_ctx.id);
+			log_debug("INIT ^^^^^^^^ iceoryx ctx [%d] ^^^^^^^^ \n",
+			    work->extra_ctx.id);
 			nng_aio_set_prov_data(work->aio, work->iceoryx_suber);
 			nng_ctx_recv(work->extra_ctx, work->aio);
 #endif
 		} else {
-			log_debug("INIT ^^^^^^^^ extra ctx [%d] ^^^^^^^^ \n", work->extra_ctx.id);
+			log_debug("INIT ^^^^^^^^ extra ctx [%d] ^^^^^^^^ \n",
+			    work->extra_ctx.id);
 			nng_ctx_recv(work->extra_ctx, work->aio);
 		}
 		break;
@@ -352,10 +406,12 @@ server_cb(void *arg)
 			} else {
 				// check notify msg of bridge
 				if (rv != NNG_ECONNSHUT || msg == NULL) {
-					nng_ctx_recv(work->extra_ctx, work->aio);
+					nng_ctx_recv(
+					    work->extra_ctx, work->aio);
 					break;
 				}
-				log_info("bridge aio closed with reason %d\n", rv);
+				log_info(
+				    "bridge aio closed with reason %d\n", rv);
 			}
 		}
 
@@ -366,7 +422,7 @@ server_cb(void *arg)
 			} else if (type == CMD_PUBLISH) {
 				if (rv == 0) {
 					// only re-coding normal bridigng msg
-					work->msg       = msg;
+					work->msg = msg;
 					bridge_downward_msg_coding(work);
 				} else {
 					// exclude disconnet event msg
@@ -384,7 +440,8 @@ server_cb(void *arg)
 			nng_msg *decode_msg = NULL;
 			if (decode_common_mqtt_msg(&decode_msg, msg) != 0 ||
 			    nng_msg_get_type(decode_msg) != CMD_PUBLISH) {
-				conn_param_free(nng_msg_get_conn_param(decode_msg));
+				conn_param_free(
+				    nng_msg_get_conn_param(decode_msg));
 				work->state = RECV;
 				nng_ctx_recv(work->extra_ctx, work->aio);
 				break;
@@ -394,15 +451,19 @@ server_cb(void *arg)
 			// alloc conn_param every single time
 #if defined(SUPP_ICEORYX)
 		} else if (work->proto == PROTO_ICEORYX_BRIDGE) {
-			nng_msg *icemsg = msg;
+			nng_msg *icemsg     = msg;
 			nng_msg *decode_msg = NULL;
-			//log_debug("pld:%s", (char *)nng_msg_payload_ptr(msg));
-			// convert iceoryx msg to nng mqtt msg
-			rv = nano_iceoryx_recv_nng_msg(work->iceoryx_suber, icemsg, &decode_msg);
+			// log_debug("pld:%s", (char
+			// *)nng_msg_payload_ptr(msg));
+			//  convert iceoryx msg to nng mqtt msg
+			rv = nano_iceoryx_recv_nng_msg(
+			    work->iceoryx_suber, icemsg, &decode_msg);
 			if (rv != 0) {
-				log_error("Failed to decode iceoryx msg %d", rv);
+				log_error(
+				    "Failed to decode iceoryx msg %d", rv);
 				work->state = RECV;
-				nng_aio_set_prov_data(work->aio, work->iceoryx_suber);
+				nng_aio_set_prov_data(
+				    work->aio, work->iceoryx_suber);
 				nng_ctx_recv(work->extra_ctx, work->aio);
 				break;
 			}
@@ -419,10 +480,11 @@ server_cb(void *arg)
 		work->flag      = nng_msg_cmd_type(msg);
 
 		if (work->flag == CMD_SUBSCRIBE) {
-			smsg = work->msg;
+			smsg          = work->msg;
 			work->msg_ret = NULL;
 
-			if ((work->sub_pkt = nng_alloc(sizeof(packet_subscribe))) == NULL)
+			if ((work->sub_pkt = nng_alloc(
+			         sizeof(packet_subscribe))) == NULL)
 				log_error("nng_alloc");
 			memset(work->sub_pkt, '\0', sizeof(packet_subscribe));
 
@@ -435,13 +497,16 @@ server_cb(void *arg)
 			// TODO not all codes needs to close the pipe
 			if (work->code != SUCCESS) {
 				if (work->msg_ret) {
-					for (size_t i = 0; i < cvector_size(work->msg_ret); i++)
+					for (size_t i = 0;
+					    i < cvector_size(work->msg_ret);
+					    i++)
 						nng_msg_free(work->msg_ret[i]);
 					cvector_free(work->msg_ret);
 				}
 				if (work->sub_pkt)
 					sub_pkt_free(work->sub_pkt);
-				// free conn_param due to clone in protocol layer
+				// free conn_param due to clone in protocol
+				// layer
 				conn_param_free(work->cparam);
 
 				work->state = CLOSE;
@@ -459,47 +524,79 @@ server_cb(void *arg)
 			work->msg = NULL;
 			if (work->msg_ret) {
 				log_debug("retain msg [%p] size [%ld] \n",
-				    work->msg_ret, cvector_size(work->msg_ret));
-				for (int i = 0; i < cvector_size(work->msg_ret) &&
-				     check_msg_exp(work->msg_ret[i],
-				         nng_mqtt_msg_get_publish_property(
-				             work->msg_ret[i])); i++) {
+				    work->msg_ret,
+				    cvector_size(work->msg_ret));
+				for (int i = 0;
+				    i < cvector_size(work->msg_ret) &&
+				    check_msg_exp(work->msg_ret[i],
+				        nng_mqtt_msg_get_publish_property(
+				            work->msg_ret[i]));
+				    i++) {
 					nng_msg *m = work->msg_ret[i];
-					work->msg = m;
-					work->pub_packet = (struct pub_packet_struct *) nng_zalloc(
-										sizeof(struct pub_packet_struct));
-					void *proto_data = NULL;
-					uint8_t ver = nng_mqtt_msg_get_publish_proto_version(work->msg);
-					// ver = ver == 0 ? work->proto_ver : ver;
-					if (SUCCESS == decode_pub_message(work, ver)) {
-						bool  bridged = false;
-						proto_data = nng_msg_get_proto_data(work->msg);
-						// we simply change the msg itself
+					work->msg  = m;
+					work->pub_packet =
+					    (struct pub_packet_struct *)
+					        nng_zalloc(sizeof(
+					            struct pub_packet_struct));
+					void   *proto_data = NULL;
+					uint8_t ver =
+					    nng_mqtt_msg_get_publish_proto_version(
+					        work->msg);
+					// ver = ver == 0 ? work->proto_ver :
+					// ver;
+					if (SUCCESS ==
+					    decode_pub_message(work, ver)) {
+						bool bridged = false;
+						proto_data =
+						    nng_msg_get_proto_data(
+						        work->msg);
+						// we simply change the msg
+						// itself
 						nng_msg *rmsg = NULL;
-						if (nng_msg_dup(&rmsg, work->msg) != 0) {
-							log_error("System Failure while duplicating retain msg");
+						if (nng_msg_dup(&rmsg,
+						        work->msg) != 0) {
+							log_error(
+							    "System Failure "
+							    "while "
+							    "duplicating "
+							    "retain msg");
 						} else {
-							if (work->proto_ver == MQTT_VERSION_V5) {
-								nng_msg_set_cmd_type(rmsg,CMD_PUBLISH_V5);
+							if (work->proto_ver ==
+							    MQTT_VERSION_V5) {
+								nng_msg_set_cmd_type(
+								    rmsg,
+								    CMD_PUBLISH_V5);
 							} else {
-								nng_msg_set_cmd_type(rmsg, CMD_PUBLISH);
+								nng_msg_set_cmd_type(
+								    rmsg,
+								    CMD_PUBLISH);
 							}
 						}
-						if (encode_pub_message(rmsg, work, PUBLISH)) {
-							nng_mqtt_msg_set_sub_retain_bool(rmsg, true);
-							nng_aio_set_msg(work->aio, rmsg);
-							nng_aio_set_prov_data(work->aio, &work->pid.id);
-							nng_ctx_send(work->ctx, work->aio);
+						if (encode_pub_message(
+						        rmsg, work, PUBLISH)) {
+							nng_mqtt_msg_set_sub_retain_bool(
+							    rmsg, true);
+							nng_aio_set_msg(
+							    work->aio, rmsg);
+							nng_aio_set_prov_data(
+							    work->aio,
+							    &work->pid.id);
+							nng_ctx_send(work->ctx,
+							    work->aio);
 						} else
-							log_warn("encode retain msg failed!");
+							log_warn(
+							    "encode retain "
+							    "msg failed!");
 					} else {
-						log_warn("decode retain msg failed!");
+						log_warn("decode retain msg "
+						         "failed!");
 					}
 					free_pub_packet(work->pub_packet);
 					work->pub_packet = NULL;
 					cvector_free(work->pipe_ct->msg_infos);
 					work->pipe_ct->msg_infos = NULL;
-					// free the ref due to dbtree_find_retain
+					// free the ref due to
+					// dbtree_find_retain
 					nng_msg_free(m);
 				}
 				cvector_free(work->msg_ret);
@@ -539,7 +636,7 @@ server_cb(void *arg)
 			nng_ctx_send(work->ctx, work->aio);
 			smsg = NULL;
 			nng_aio_finish(work->aio, 0);
-			//free conn_param in SEND state
+			// free conn_param in SEND state
 			break;
 		} else if (work->flag == CMD_PUBLISH) {
 			// Set V4/V5 flag for publish msg
@@ -563,7 +660,7 @@ server_cb(void *arg)
 				break;
 			}
 			if (work->code != SUCCESS) {
-				//what if extra ctx brings a wrong msg?
+				// what if extra ctx brings a wrong msg?
 				if (work->proto != PROTO_MQTT_BROKER) {
 					work->state = SEND;
 					nng_aio_finish(work->aio, 0);
@@ -574,7 +671,8 @@ server_cb(void *arg)
 				free_pub_packet(work->pub_packet);
 				work->pub_packet = NULL;
 				cvector_free(work->pipe_ct->msg_infos);
-				// free conn_param due to clone in protocol layer
+				// free conn_param due to clone in protocol
+				// layer
 				conn_param_free(work->cparam);
 				nng_aio_finish(work->aio, 0);
 				// break or return?
@@ -585,13 +683,15 @@ server_cb(void *arg)
 			uint8_t  reason_code = *(body + 1);
 			if (work->proto == PROTO_MQTT_BROKER) {
 				// Return CONNACK to clients of broker
-				nng_aio_set_prov_data(work->aio, &work->pid.id);
+				nng_aio_set_prov_data(
+				    work->aio, &work->pid.id);
 				// clone for sending connect event notification
 				nng_msg_clone(work->msg);
 				nng_aio_set_msg(work->aio, work->msg);
 				nng_ctx_send(work->ctx, work->aio);
 			}
-			smsg = nano_msg_notify_connect(work->cparam, reason_code);
+			smsg =
+			    nano_msg_notify_connect(work->cparam, reason_code);
 			hook_entry(work, reason_code);
 			// Set V4/V5 flag for publish notify msg
 			nng_msg_set_cmd_type(smsg, CMD_PUBLISH);
@@ -601,7 +701,7 @@ server_cb(void *arg)
 			    MQTT_PROTOCOL_VERSION_v311, true);
 			// set flag after hanlde_pub to avoid bridging logic
 			work->flag = CMD_PUBLISH;
-			// remember to free conn_param in WAIT 
+			// remember to free conn_param in WAIT
 			// due to clone in protocol layer
 		} else if (work->flag == CMD_DISCONNECT_EV) {
 			// Now v4 as default/send V5 notify msg?
@@ -646,23 +746,31 @@ server_cb(void *arg)
 		if (nng_msg_get_type(work->msg) == CMD_PUBLISH) {
 			if ((rv = nng_aio_result(work->aio)) != 0) {
 				log_error("WAIT nng aio result error: %d", rv);
-				NANO_NNG_FATAL("WAIT nng_ctx_recv/send", rv);	// shall nerver reach here
+				NANO_NNG_FATAL("WAIT nng_ctx_recv/send",
+				    rv); // shall nerver reach here
 			}
-			smsg      = work->msg; // reuse the same msg
+			smsg = work->msg; // reuse the same msg
 			cvector(mqtt_msg_info) msg_infos;
 			msg_infos = work->pipe_ct->msg_infos;
 
-			log_trace("total subscribed pipes: %ld", cvector_size(msg_infos));
+			log_trace("total subscribed pipes: %ld",
+			    cvector_size(msg_infos));
 			if (cvector_size(msg_infos))
 				if (encode_pub_message(smsg, work, PUBLISH)) {
-					for (int i = 0; i < cvector_size(msg_infos) && rv== 0; ++i) {
+					for (int i = 0;
+					    i < cvector_size(msg_infos) &&
+					    rv == 0;
+					    ++i) {
 						msg_info = &msg_infos[i];
 						nng_msg_clone(smsg);
 						work->pid.id = msg_info->pipe;
-						nng_aio_set_prov_data(work->aio, &work->pid.id);
+						nng_aio_set_prov_data(
+						    work->aio, &work->pid.id);
 						work->msg = smsg;
-						nng_aio_set_msg(work->aio, work->msg);
-						nng_ctx_send(work->ctx, work->aio);
+						nng_aio_set_msg(
+						    work->aio, work->msg);
+						nng_ctx_send(
+						    work->ctx, work->aio);
 					}
 				}
 			work->msg = smsg;
@@ -674,20 +782,26 @@ server_cb(void *arg)
 				aws_bridge_forward(work);
 #endif
 #if defined(SUPP_PLUGIN)
-				/* after bridge_handler which will dup user property */
+				/* after bridge_handler which will dup user
+				 * property */
 				if (work->user_property != NULL) {
-					property_remove(work->pub_packet->var_header
-								.publish.properties, work->user_property->id);
-					if (work->pub_packet->var_header.publish.properties != NULL) {
-						property_free(work->pub_packet->var_header.publish.properties);
+					property_remove(
+					    work->pub_packet->var_header
+					        .publish.properties,
+					    work->user_property->id);
+					if (work->pub_packet->var_header
+					        .publish.properties != NULL) {
+						property_free(work->pub_packet
+						        ->var_header.publish
+						        .properties);
 					}
 				}
 #endif
 			}
-			//check webhook & rule engine
+			// check webhook & rule engine
 			conf_web_hook *hook_conf = &(work->config->web_hook);
 			conf_exchange *exge_conf = &(work->config->exchange);
-			uint8_t rule_opt = RULE_ENG_OFF;
+			uint8_t        rule_opt  = RULE_ENG_OFF;
 #if defined(SUPP_RULE_ENGINE)
 			rule_opt = work->config->rule_eng.option;
 #endif
@@ -695,15 +809,15 @@ server_cb(void *arg)
 #if defined(SUPP_ICEORYX)
 			iceoryx_opt = 1;
 #endif
-			if (hook_conf->enable || exge_conf->count > 0 || 
-			        rule_opt != RULE_ENG_OFF || iceoryx_opt == 1) {
+			if (hook_conf->enable || exge_conf->count > 0 ||
+			    rule_opt != RULE_ENG_OFF || iceoryx_opt == 1) {
 				work->state = SEND;
 				nng_aio_finish(work->aio, 0);
 				break;
 			}
 			// skip one IO switching
 			nng_msg_free(work->msg);
-			smsg = NULL;
+			smsg      = NULL;
 			work->msg = NULL;
 			// free conn_param due to clone in protocol layer
 			conn_param_free(work->cparam);
@@ -739,17 +853,23 @@ server_cb(void *arg)
 	case SEND:
 		log_debug("SEND ^^^^ ctx%d ^^^^", work->ctx.id);
 #if defined(SUPP_RULE_ENGINE)
-		if (work->flag == CMD_PUBLISH && work->config->rule_eng.option != RULE_ENG_OFF) {
+		if (work->flag == CMD_PUBLISH &&
+		    work->config->rule_eng.option != RULE_ENG_OFF) {
 			rule_engine_insert_sql(work);
 		}
 #endif
 #if defined(SUPP_ICEORYX)
 		if (work->flag == CMD_PUBLISH && work->msg != NULL &&
-		        true == nano_iceoryx_topic_filter("ice/fwd",
-		        work->pub_packet->var_header.publish.topic_name.body,
-		        work->pub_packet->var_header.publish.topic_name.len)) {
-			if (0 != (rv = nano_iceoryx_send_nng_msg(
-			        work->iceoryx_puber, work->msg, &work->iceoryx_sock))) {
+		    true ==
+		        nano_iceoryx_topic_filter("ice/fwd",
+		            work->pub_packet->var_header.publish.topic_name
+		                .body,
+		            work->pub_packet->var_header.publish.topic_name
+		                .len)) {
+			if (0 !=
+			    (rv = nano_iceoryx_send_nng_msg(
+			         work->iceoryx_puber, work->msg,
+			         &work->iceoryx_sock))) {
 				log_error("Failed to send iceoryx %d", rv);
 			}
 		}
@@ -784,7 +904,7 @@ server_cb(void *arg)
 			nng_aio_set_prov_data(work->aio, work->iceoryx_suber);
 			nng_ctx_recv(work->extra_ctx, work->aio);
 #endif
-		} else{
+		} else {
 			nng_ctx_recv(work->extra_ctx, work->aio);
 		}
 		break;
@@ -795,27 +915,31 @@ server_cb(void *arg)
 			if ((rv = nng_aio_result(work->aio)) != 0) {
 				log_error("WAIT nng aio result error: %d", rv);
 			}
-			smsg      = work->msg; // reuse the same msg
+			smsg = work->msg; // reuse the same msg
 
 			cvector(mqtt_msg_info) msg_infos;
 			msg_infos = work->pipe_ct->msg_infos;
 
 			log_debug("total pipes: %ld", cvector_size(msg_infos));
-			//TODO encode abstract msg only
+			// TODO encode abstract msg only
 			if (cvector_size(msg_infos))
 				if (encode_pub_message(smsg, work, PUBLISH))
-					for (int i=0; i<cvector_size(msg_infos); ++i) {
+					for (int i = 0;
+					    i < cvector_size(msg_infos); ++i) {
 						msg_info = &msg_infos[i];
 						nng_msg_clone(smsg);
 						work->pid.id = msg_info->pipe;
-						nng_aio_set_prov_data(work->aio, &work->pid.id);
+						nng_aio_set_prov_data(
+						    work->aio, &work->pid.id);
 						work->msg = smsg;
-						nng_aio_set_msg(work->aio, work->msg);
-						nng_ctx_send(work->ctx, work->aio);
+						nng_aio_set_msg(
+						    work->aio, work->msg);
+						nng_ctx_send(
+						    work->ctx, work->aio);
 					}
 			hook_entry(work, 0);
 			nng_msg_free(smsg);
-			smsg = NULL;
+			smsg      = NULL;
 			work->msg = NULL;
 			free_pub_packet(work->pub_packet);
 			work->pub_packet = NULL;
@@ -834,10 +958,11 @@ server_cb(void *arg)
 			             work->cparam),
 			         conn_param_get_protover(work->cparam),
 			         nng_clock())) != NULL) {
-				work->msg = msg;
+				work->msg  = msg;
 				work->flag = CMD_PUBLISH;
 				// Set V4/V5 flag for publish msg
-				if (conn_param_get_protover(work->cparam) == 5) {
+				if (conn_param_get_protover(work->cparam) ==
+				    5) {
 					property *will_property =
 					    conn_param_get_will_property(
 					        work->cparam);
@@ -849,9 +974,10 @@ server_cb(void *arg)
 					    .properties = property_pub_by_will(
 					    will_property);
 					work->pub_packet->var_header.publish
-					    .prop_len = get_mqtt_properties_len(
-					    work->pub_packet->var_header
-					        .publish.properties);
+					    .prop_len =
+					    get_mqtt_properties_len(
+					        work->pub_packet->var_header
+					            .publish.properties);
 				} else {
 					nng_msg_set_cmd_type(msg, CMD_PUBLISH);
 					handle_pub(work, work->pipe_ct,
@@ -860,16 +986,18 @@ server_cb(void *arg)
 				work->state = WAIT;
 				nng_aio_finish(work->aio, 0);
 			} else {
-				// free Conn_param once more in case invalid last-will msg
+				// free Conn_param once more in case invalid
+				// last-will msg
 				conn_param_free(work->cparam);
 				if (work->msg != NULL)
 					nng_msg_free(work->msg);
-				work->msg = NULL;
+				work->msg   = NULL;
 				work->state = RECV;
 				if (work->proto == PROTO_MQTT_BROKER) {
 					nng_ctx_recv(work->ctx, work->aio);
 				} else {
-					nng_ctx_recv(work->extra_ctx, work->aio);
+					nng_ctx_recv(
+					    work->extra_ctx, work->aio);
 				}
 			}
 		}
@@ -887,7 +1015,7 @@ server_cb(void *arg)
 		nng_ctx_send(work->ctx, work->aio);
 
 		// clear reason code
-		work->code = SUCCESS;
+		work->code  = SUCCESS;
 		work->state = RECV;
 		nng_ctx_recv(work->ctx, work->aio);
 		break;
@@ -949,7 +1077,6 @@ proto_work_init(nng_socket sock, nng_socket extrasock, uint8_t proto,
 	w->tsconn = NULL;
 #endif
 
-
 #if defined(NNG_SUPP_SQLITE)
 	nng_socket_get_ptr(sock, NMQ_OPT_MQTT_QOS_DB, &w->sqlite_db);
 #endif
@@ -961,30 +1088,33 @@ proto_work_init(nng_socket sock, nng_socket extrasock, uint8_t proto,
 		}
 #if defined(SUPP_ICEORYX)
 	} else if (proto == PROTO_ICEORYX_BRIDGE) {
-			if ((rv = nng_ctx_open(&w->extra_ctx, extrasock)) != 0) {
-				NANO_NNG_FATAL("nng_ctx_open", rv);
-			}
+		if ((rv = nng_ctx_open(&w->extra_ctx, extrasock)) != 0) {
+			NANO_NNG_FATAL("nng_ctx_open", rv);
+		}
 #endif
 	} else if (config->bridge_mode) {
 		if (proto == PROTO_MQTT_BRIDGE) {
-			if ((rv = nng_ctx_open(&w->extra_ctx, extrasock)) != 0) {
+			if ((rv = nng_ctx_open(&w->extra_ctx, extrasock)) !=
+			    0) {
 				NANO_NNG_FATAL("nng_ctx_open", rv);
 			}
 		} else if (proto == PROTO_AWS_BRIDGE) {
-			if ((rv = nng_ctx_open(&w->extra_ctx, extrasock)) != 0) {
+			if ((rv = nng_ctx_open(&w->extra_ctx, extrasock)) !=
+			    0) {
 				NANO_NNG_FATAL("nng_ctx_open", rv);
 			}
 		}
 	}
 
-	if(config->web_hook.enable || config->exchange.count > 0) {
+	if (config->web_hook.enable || config->exchange.count > 0) {
 		if ((rv = nng_push0_open(&w->hook_sock)) != 0) {
 			NANO_NNG_FATAL("nng_socket", rv);
 		}
 		char *hook_ipc_url = config->hook_ipc_url == NULL
 		    ? HOOK_IPC_URL
 		    : config->hook_ipc_url;
-		if ((rv = nng_dial(w->hook_sock, hook_ipc_url, NULL, 0)) != 0) {
+		if ((rv = nng_dial(w->hook_sock, hook_ipc_url, NULL, 0)) !=
+		    0) {
 			NANO_NNG_FATAL("hook nng_dial", rv);
 		}
 	}
@@ -992,8 +1122,713 @@ proto_work_init(nng_socket sock, nng_socket extrasock, uint8_t proto,
 	return w;
 }
 
-static dbtree           *db        = NULL;
-static dbtree           *db_ret    = NULL;
+void
+vcas_server_cb(void *arg)
+{
+	nano_work *work = arg;
+	nng_msg   *msg  = NULL;
+	nng_msg   *smsg = NULL;
+	int        rv;
+
+	mqtt_msg_info *msg_info;
+	nng_socket    *newsock = NULL;
+
+	switch (work->state) {
+	case INIT:
+		// log_debug("INIT ^^^^^^^^ ctx [%d] ^^^^^^^^ \n",
+		// work->ctx.id);
+		work->state = RECV;
+		if (work->proto == PROTO_MQTT_BROKER) {
+			log_debug("INIT ^^^^^^^^ ctx [%d] ^^^^^^^^ \n",
+			    work->ctx.id);
+			nng_ctx_recv(work->ctx, work->aio);
+#if defined(SUPP_ICEORYX)
+		} else if (work->proto == PROTO_ICEORYX_BRIDGE) {
+			log_debug("INIT ^^^^^^^^ iceoryx ctx [%d] ^^^^^^^^ \n",
+			    work->extra_ctx.id);
+			nng_aio_set_prov_data(work->aio, work->iceoryx_suber);
+			nng_ctx_recv(work->extra_ctx, work->aio);
+#endif
+		} else {
+			log_debug("INIT ^^^^^^^^ extra ctx [%d] ^^^^^^^^ \n",
+			    work->extra_ctx.id);
+			nng_ctx_recv(work->extra_ctx, work->aio);
+		}
+		break;
+	case RECV:
+		log_debug("RECV  ^^^^ ctx%d ^^^^\n", work->ctx.id);
+		msg = nng_aio_get_msg(work->aio);
+		if ((rv = nng_aio_result(work->aio)) != 0) {
+			log_info("RECV aio result: %d", rv);
+			work->state = RECV;
+			if (work->proto == PROTO_MQTT_BROKER) {
+				if (msg != NULL)
+					nng_msg_free(msg);
+				nng_ctx_recv(work->ctx, work->aio);
+				break;
+			} else {
+				// check notify msg of bridge
+				if (rv != NNG_ECONNSHUT || msg == NULL) {
+					nng_ctx_recv(
+					    work->extra_ctx, work->aio);
+					break;
+				}
+				log_info(
+				    "bridge aio closed with reason %d\n", rv);
+			}
+		}
+
+		if (work->proto == PROTO_MQTT_BRIDGE) {
+			uint8_t type = nng_msg_get_type(msg);
+			if (type == CMD_CONNACK) {
+				log_info("bridge client is connected!");
+			} else if (type == CMD_PUBLISH) {
+				if (rv == 0) {
+					// only re-coding normal bridigng msg
+					work->msg = msg;
+					bridge_downward_msg_coding(work);
+				} else {
+					// exclude disconnet event msg
+				}
+			} else {
+				// only accept publish/CONNACK/DISCONNECT
+				// msg from upstream
+				work->state = RECV;
+				nng_msg_free(msg);
+				nng_ctx_recv(work->extra_ctx, work->aio);
+				break;
+			}
+		} else if (work->proto == PROTO_HTTP_SERVER ||
+		    work->proto == PROTO_AWS_BRIDGE) {
+			nng_msg *decode_msg = NULL;
+			if (decode_common_mqtt_msg(&decode_msg, msg) != 0 ||
+			    nng_msg_get_type(decode_msg) != CMD_PUBLISH) {
+				conn_param_free(
+				    nng_msg_get_conn_param(decode_msg));
+				work->state = RECV;
+				nng_ctx_recv(work->extra_ctx, work->aio);
+				break;
+			}
+			msg = decode_msg;
+			nng_msg_set_cmd_type(msg, CMD_PUBLISH);
+			// alloc conn_param every single time
+#if defined(SUPP_ICEORYX)
+		} else if (work->proto == PROTO_ICEORYX_BRIDGE) {
+			nng_msg *icemsg     = msg;
+			nng_msg *decode_msg = NULL;
+			// log_debug("pld:%s", (char
+			// *)nng_msg_payload_ptr(msg));
+			//  convert iceoryx msg to nng mqtt msg
+			rv = nano_iceoryx_recv_nng_msg(
+			    work->iceoryx_suber, icemsg, &decode_msg);
+			if (rv != 0) {
+				log_error(
+				    "Failed to decode iceoryx msg %d", rv);
+				work->state = RECV;
+				nng_aio_set_prov_data(
+				    work->aio, work->iceoryx_suber);
+				nng_ctx_recv(work->extra_ctx, work->aio);
+				break;
+			}
+			msg = decode_msg;
+			nng_msg_set_cmd_type(msg, CMD_PUBLISH);
+			nng_msg_iceoryx_free(icemsg, work->iceoryx_suber);
+#endif
+		}
+		// processing what we got now
+		work->msg       = msg;
+		work->pid       = nng_msg_get_pipe(work->msg);
+		work->cparam    = nng_msg_get_conn_param(work->msg);
+		work->proto_ver = conn_param_get_protover(work->cparam);
+		work->flag      = nng_msg_cmd_type(msg);
+
+		if (work->flag == CMD_SUBSCRIBE) {
+			smsg          = work->msg;
+			work->msg_ret = NULL;
+
+			if ((work->sub_pkt = nng_alloc(
+			         sizeof(packet_subscribe))) == NULL)
+				log_error("nng_alloc");
+			memset(work->sub_pkt, '\0', sizeof(packet_subscribe));
+
+			if ((rv = decode_sub_msg(work)) != 0 ||
+			    (rv = sub_ctx_handle(work)) != 0) {
+				work->code = rv;
+				log_error("sub_handler: [%d]", rv);
+			}
+
+			// TODO not all codes needs to close the pipe
+			if (work->code != SUCCESS) {
+				if (work->msg_ret) {
+					for (size_t i = 0;
+					    i < cvector_size(work->msg_ret);
+					    i++)
+						nng_msg_free(work->msg_ret[i]);
+					cvector_free(work->msg_ret);
+				}
+				if (work->sub_pkt)
+					sub_pkt_free(work->sub_pkt);
+				// free conn_param due to clone in protocol
+				// layer
+				conn_param_free(work->cparam);
+
+				work->state = CLOSE;
+				nng_aio_finish(work->aio, 0);
+				break;
+			}
+			bridge_sub_handler(work);
+
+			// TODO Error handling
+			if (0 != (rv = encode_suback_msg(smsg, work)))
+				log_error("error in encode suback: [%d]", rv);
+
+			sub_pkt_free(work->sub_pkt);
+			// handle retain (Retain flag handled in npipe)
+			work->msg = NULL;
+			if (work->msg_ret) {
+				log_debug("retain msg [%p] size [%ld] \n",
+				    work->msg_ret,
+				    cvector_size(work->msg_ret));
+				for (int i = 0;
+				    i < cvector_size(work->msg_ret) &&
+				    check_msg_exp(work->msg_ret[i],
+				        nng_mqtt_msg_get_publish_property(
+				            work->msg_ret[i]));
+				    i++) {
+					nng_msg *m = work->msg_ret[i];
+					work->msg  = m;
+					work->pub_packet =
+					    (struct pub_packet_struct *)
+					        nng_zalloc(sizeof(
+					            struct pub_packet_struct));
+					void   *proto_data = NULL;
+					uint8_t ver =
+					    nng_mqtt_msg_get_publish_proto_version(
+					        work->msg);
+					// ver = ver == 0 ? work->proto_ver :
+					// ver;
+					if (SUCCESS ==
+					    decode_pub_message(work, ver)) {
+						bool bridged = false;
+						proto_data =
+						    nng_msg_get_proto_data(
+						        work->msg);
+						// we simply change the msg
+						// itself
+						nng_msg *rmsg = NULL;
+						if (nng_msg_dup(&rmsg,
+						        work->msg) != 0) {
+							log_error(
+							    "System Failure "
+							    "while "
+							    "duplicating "
+							    "retain msg");
+						} else {
+							if (work->proto_ver ==
+							    MQTT_VERSION_V5) {
+								nng_msg_set_cmd_type(
+								    rmsg,
+								    CMD_PUBLISH_V5);
+							} else {
+								nng_msg_set_cmd_type(
+								    rmsg,
+								    CMD_PUBLISH);
+							}
+						}
+						if (encode_pub_message(
+						        rmsg, work, PUBLISH)) {
+							nng_mqtt_msg_set_sub_retain_bool(
+							    rmsg, true);
+							nng_aio_set_msg(
+							    work->aio, rmsg);
+							nng_aio_set_prov_data(
+							    work->aio,
+							    &work->pid.id);
+							nng_ctx_send(work->ctx,
+							    work->aio);
+						} else
+							log_warn(
+							    "encode retain "
+							    "msg failed!");
+					} else {
+						log_warn("decode retain msg "
+						         "failed!");
+					}
+					free_pub_packet(work->pub_packet);
+					work->pub_packet = NULL;
+					cvector_free(work->pipe_ct->msg_infos);
+					work->pipe_ct->msg_infos = NULL;
+					// free the ref due to
+					// dbtree_find_retain
+					nng_msg_free(m);
+				}
+				cvector_free(work->msg_ret);
+			}
+			nng_msg_set_cmd_type(smsg, CMD_SUBACK);
+			nng_aio_set_prov_data(work->aio, &work->pid.id);
+			nng_aio_set_msg(work->aio, smsg);
+			work->msg   = NULL;
+			work->state = SEND;
+			nng_ctx_send(work->ctx, work->aio);
+			smsg = NULL;
+			nng_aio_finish(work->aio, 0);
+			// free conn_param in SEND state
+			break;
+		} else if (work->flag == CMD_UNSUBSCRIBE) {
+			smsg = work->msg;
+			if ((work->unsub_pkt = nng_alloc(
+			         sizeof(packet_unsubscribe))) == NULL)
+				log_error("nng_alloc");
+
+			if ((rv = decode_unsub_msg(work)) != 0 ||
+			    (rv = unsub_ctx_handle(work)) != 0) {
+				log_error("unsub_handler [%d]", rv);
+			}
+			// proxy unsub action to bridge
+			bridge_sub_handler(work);
+
+			if (0 != (rv = encode_unsuback_msg(smsg, work)))
+				log_error("in unsuback [%d]", rv);
+
+			// free unsub_pkt
+			unsub_pkt_free(work->unsub_pkt);
+			nng_aio_set_prov_data(work->aio, &work->pid.id);
+			nng_aio_set_msg(work->aio, work->msg);
+			work->msg   = NULL;
+			work->state = SEND;
+			nng_ctx_send(work->ctx, work->aio);
+			smsg = NULL;
+			nng_aio_finish(work->aio, 0);
+			// free conn_param in SEND state
+			break;
+		} else if (work->flag == CMD_PUBLISH) {
+			// Set V4/V5 flag for publish msg
+			if (work->proto_ver == MQTT_VERSION_V5) {
+				nng_msg_set_cmd_type(msg, CMD_PUBLISH_V5);
+			} else {
+				nng_msg_set_cmd_type(msg, CMD_PUBLISH);
+			}
+			work->code = handle_pub(
+			    work, work->pipe_ct, work->proto_ver, false);
+			if (work->proto == PROTO_HTTP_SERVER ||
+			    work->proto == PROTO_AWS_BRIDGE) {
+				nng_msg *rep_msg;
+				nng_msg_alloc(&rep_msg, 0);
+				nng_aio_set_msg(work->aio, rep_msg);
+				if (work->code == SUCCESS)
+					work->state = WAIT;
+				else
+					work->state = SEND;
+				nng_ctx_send(work->extra_ctx, work->aio);
+				break;
+			}
+			if (work->code != SUCCESS) {
+				// what if extra ctx brings a wrong msg?
+				if (work->proto != PROTO_MQTT_BROKER) {
+					work->state = SEND;
+					nng_aio_finish(work->aio, 0);
+					// break or return?
+					break;
+				}
+				work->state = CLOSE;
+				free_pub_packet(work->pub_packet);
+				work->pub_packet = NULL;
+				cvector_free(work->pipe_ct->msg_infos);
+				// free conn_param due to clone in protocol
+				// layer
+				conn_param_free(work->cparam);
+				nng_aio_finish(work->aio, 0);
+				// break or return?
+				break;
+			}
+		} else if (work->flag == CMD_CONNACK) {
+			uint8_t *body        = nng_msg_body(work->msg);
+			uint8_t  reason_code = *(body + 1);
+			if (work->proto == PROTO_MQTT_BROKER) {
+				// Return CONNACK to clients of broker
+				nng_aio_set_prov_data(
+				    work->aio, &work->pid.id);
+				// clone for sending connect event notification
+				nng_msg_clone(work->msg);
+				nng_aio_set_msg(work->aio, work->msg);
+				nng_ctx_send(work->ctx, work->aio);
+			}
+			smsg =
+			    nano_msg_notify_connect(work->cparam, reason_code);
+			hook_entry(work, reason_code);
+			// Set V4/V5 flag for publish notify msg
+			nng_msg_set_cmd_type(smsg, CMD_PUBLISH);
+			nng_msg_free(work->msg);
+			work->msg = smsg;
+			handle_pub(work, work->pipe_ct,
+			    MQTT_PROTOCOL_VERSION_v311, true);
+			// set flag after hanlde_pub to avoid bridging logic
+			work->flag = CMD_PUBLISH;
+			// remember to free conn_param in WAIT
+			// due to clone in protocol layer
+		} else if (work->flag == CMD_DISCONNECT_EV) {
+			// Now v4 as default/send V5 notify msg?
+			hook_entry(work, 0);
+			nng_msg_set_cmd_type(msg, CMD_PUBLISH);
+			handle_pub(work, work->pipe_ct,
+			    MQTT_PROTOCOL_VERSION_v311, true);
+			work->flag = CMD_PUBLISH;
+			// TODO set reason code
+			// uint8_t *payload = nng_msg_payload_ptr(work->msg);
+			// uint8_t reason_code = *(payload+16);
+			// free client ctx
+			if (dbhash_check_id(work->pid.id)) {
+				destroy_sub_client(work->pid.id, work->db);
+			}
+			// bridge's will msg only valid at remote
+			if (work->proto != PROTO_MQTT_BRIDGE) {
+				if (conn_param_get_will_flag(work->cparam) ==
+				        0 ||
+				    !conn_param_get_will_topic(work->cparam) ||
+				    !conn_param_get_will_msg(work->cparam)) {
+					// no will msg - free the cp
+					conn_param_free(work->cparam);
+				} else {
+					// set to END to send will msg
+					work->state = END;
+					// leave cp for will msg
+					nng_aio_finish(work->aio, 0);
+					break;
+				}
+			}
+		}
+		work->state = WAIT;
+		nng_aio_finish(work->aio, 0);
+		break;
+	case WAIT:
+		// do not access to cparam
+		log_debug("WAIT ^^^^ ctx%d ^^^^", work->ctx.id);
+#if defined(SUPP_PLUGIN)
+		work->user_property = NULL;
+#endif
+		if (nng_msg_get_type(work->msg) == CMD_PUBLISH) {
+			if ((rv = nng_aio_result(work->aio)) != 0) {
+				log_error("WAIT nng aio result error: %d", rv);
+				NANO_NNG_FATAL("WAIT nng_ctx_recv/send",
+				    rv); // shall nerver reach here
+			}
+			smsg = work->msg; // reuse the same msg
+			cvector(mqtt_msg_info) msg_infos;
+			msg_infos = work->pipe_ct->msg_infos;
+
+			log_trace("total subscribed pipes: %ld",
+			    cvector_size(msg_infos));
+			if (cvector_size(msg_infos))
+				if (encode_pub_message(smsg, work, PUBLISH)) {
+					for (int i = 0;
+					    i < cvector_size(msg_infos) &&
+					    rv == 0;
+					    ++i) {
+						msg_info = &msg_infos[i];
+						nng_msg_clone(smsg);
+						work->pid.id = msg_info->pipe;
+						nng_aio_set_prov_data(
+						    work->aio, &work->pid.id);
+						work->msg = smsg;
+						nng_aio_set_msg(
+						    work->aio, work->msg);
+						nng_ctx_send(
+						    work->ctx, work->aio);
+					}
+				}
+			work->msg = smsg;
+
+			// bridge logic first
+			if (work->config->bridge_mode) {
+				bridge_pub_handler(work);
+#if defined(SUPP_AWS_BRIDGE)
+				aws_bridge_forward(work);
+#endif
+#if defined(SUPP_PLUGIN)
+				/* after bridge_handler which will dup user
+				 * property */
+				if (work->user_property != NULL) {
+					property_remove(
+					    work->pub_packet->var_header
+					        .publish.properties,
+					    work->user_property->id);
+					if (work->pub_packet->var_header
+					        .publish.properties != NULL) {
+						property_free(work->pub_packet
+						        ->var_header.publish
+						        .properties);
+					}
+				}
+#endif
+			}
+			// check webhook & rule engine
+			conf_web_hook *hook_conf = &(work->config->web_hook);
+			conf_exchange *exge_conf = &(work->config->exchange);
+			uint8_t        rule_opt  = RULE_ENG_OFF;
+#if defined(SUPP_RULE_ENGINE)
+			rule_opt = work->config->rule_eng.option;
+#endif
+			uint8_t iceoryx_opt = 0;
+#if defined(SUPP_ICEORYX)
+			iceoryx_opt = 1;
+#endif
+			if (hook_conf->enable || exge_conf->count > 0 ||
+			    rule_opt != RULE_ENG_OFF || iceoryx_opt == 1) {
+				work->state = SEND;
+				nng_aio_finish(work->aio, 0);
+				break;
+			}
+			// skip one IO switching
+			nng_msg_free(work->msg);
+			smsg      = NULL;
+			work->msg = NULL;
+			// free conn_param due to clone in protocol layer
+			conn_param_free(work->cparam);
+			free_pub_packet(work->pub_packet);
+			work->pub_packet = NULL;
+			cvector_free(msg_infos);
+			work->pipe_ct->msg_infos = NULL;
+			init_pipe_content(work->pipe_ct);
+			work->state = RECV;
+			if (work->proto != PROTO_MQTT_BROKER) {
+				nng_ctx_recv(work->extra_ctx, work->aio);
+			} else {
+				nng_ctx_recv(work->ctx, work->aio);
+			}
+		} else if (nng_msg_cmd_type(work->msg) == CMD_PUBACK ||
+		    nng_msg_cmd_type(work->msg) == CMD_PUBREL ||
+		    nng_msg_cmd_type(work->msg) == CMD_PUBCOMP) {
+			nng_msg_free(work->msg);
+			work->msg   = NULL;
+			work->state = RECV;
+			nng_ctx_recv(work->ctx, work->aio);
+			break;
+		} else {
+			log_debug("broker has nothing to do");
+			if (work->msg != NULL)
+				nng_msg_free(work->msg);
+			work->msg   = NULL;
+			work->state = RECV;
+			nng_ctx_recv(work->ctx, work->aio);
+			break;
+		}
+		break;
+	case SEND:
+		log_debug("SEND ^^^^ ctx%d ^^^^", work->ctx.id);
+#if defined(SUPP_RULE_ENGINE)
+		if (work->flag == CMD_PUBLISH &&
+		    work->config->rule_eng.option != RULE_ENG_OFF) {
+			rule_engine_insert_sql(work);
+		}
+#endif
+#if defined(SUPP_ICEORYX)
+		if (work->flag == CMD_PUBLISH && work->msg != NULL &&
+		    true ==
+		        nano_iceoryx_topic_filter("ice/fwd",
+		            work->pub_packet->var_header.publish.topic_name
+		                .body,
+		            work->pub_packet->var_header.publish.topic_name
+		                .len)) {
+			if (0 !=
+			    (rv = nano_iceoryx_send_nng_msg(
+			         work->iceoryx_puber, work->msg,
+			         &work->iceoryx_sock))) {
+				log_error("Failed to send iceoryx %d", rv);
+			}
+		}
+#endif
+		// external hook here
+		hook_entry(work, 0);
+
+		if (NULL != work->msg) {
+			nng_msg_free(work->msg);
+			work->msg = NULL;
+		}
+		if ((rv = nng_aio_result(work->aio)) != 0) {
+			log_error("SEND nng_ctx_send error %d", rv);
+		}
+		if (work->pub_packet != NULL) {
+			free_pub_packet(work->pub_packet);
+			work->pub_packet = NULL;
+		}
+		if (work->pipe_ct->msg_infos != NULL) {
+			cvector_free(work->pipe_ct->msg_infos);
+			work->pipe_ct->msg_infos = NULL;
+			init_pipe_content(work->pipe_ct);
+		}
+		// free conn_param due to clone in protocol layer
+		conn_param_free(work->cparam);
+		work->state = RECV;
+		work->flag  = 0;
+		if (work->proto == PROTO_MQTT_BROKER) {
+			nng_ctx_recv(work->ctx, work->aio);
+#if defined(SUPP_ICEORYX)
+		} else if (work->proto == PROTO_ICEORYX_BRIDGE) {
+			nng_aio_set_prov_data(work->aio, work->iceoryx_suber);
+			nng_ctx_recv(work->extra_ctx, work->aio);
+#endif
+		} else {
+			nng_ctx_recv(work->extra_ctx, work->aio);
+		}
+		break;
+	case END:
+		log_debug("END ^^^^ ctx%d ^^^^ ", work->ctx.id);
+		// send disconnect event msg first
+		if (nng_msg_get_type(work->msg) == CMD_PUBLISH) {
+			if ((rv = nng_aio_result(work->aio)) != 0) {
+				log_error("WAIT nng aio result error: %d", rv);
+			}
+			smsg = work->msg; // reuse the same msg
+
+			cvector(mqtt_msg_info) msg_infos;
+			msg_infos = work->pipe_ct->msg_infos;
+
+			log_debug("total pipes: %ld", cvector_size(msg_infos));
+			// TODO encode abstract msg only
+			if (cvector_size(msg_infos))
+				if (encode_pub_message(smsg, work, PUBLISH))
+					for (int i = 0;
+					    i < cvector_size(msg_infos); ++i) {
+						msg_info = &msg_infos[i];
+						nng_msg_clone(smsg);
+						work->pid.id = msg_info->pipe;
+						nng_aio_set_prov_data(
+						    work->aio, &work->pid.id);
+						work->msg = smsg;
+						nng_aio_set_msg(
+						    work->aio, work->msg);
+						nng_ctx_send(
+						    work->ctx, work->aio);
+					}
+			hook_entry(work, 0);
+			nng_msg_free(smsg);
+			smsg      = NULL;
+			work->msg = NULL;
+			free_pub_packet(work->pub_packet);
+			work->pub_packet = NULL;
+			cvector_free(work->pipe_ct->msg_infos);
+			work->pipe_ct->msg_infos = NULL;
+			init_pipe_content(work->pipe_ct);
+
+			// processing will msg
+			if (conn_param_get_will_flag(work->cparam) &&
+			    (msg = nano_pubmsg_composer(&msg,
+			         conn_param_get_will_retain(work->cparam),
+			         conn_param_get_will_qos(work->cparam),
+			         (mqtt_string *) conn_param_get_will_msg(
+			             work->cparam),
+			         (mqtt_string *) conn_param_get_will_topic(
+			             work->cparam),
+			         conn_param_get_protover(work->cparam),
+			         nng_clock())) != NULL) {
+				work->msg  = msg;
+				work->flag = CMD_PUBLISH;
+				// Set V4/V5 flag for publish msg
+				if (conn_param_get_protover(work->cparam) ==
+				    5) {
+					property *will_property =
+					    conn_param_get_will_property(
+					        work->cparam);
+					nng_msg_set_cmd_type(
+					    msg, CMD_PUBLISH_V5);
+					handle_pub(work, work->pipe_ct,
+					    MQTT_PROTOCOL_VERSION_v5, false);
+					work->pub_packet->var_header.publish
+					    .properties = property_pub_by_will(
+					    will_property);
+					work->pub_packet->var_header.publish
+					    .prop_len =
+					    get_mqtt_properties_len(
+					        work->pub_packet->var_header
+					            .publish.properties);
+				} else {
+					nng_msg_set_cmd_type(msg, CMD_PUBLISH);
+					handle_pub(work, work->pipe_ct,
+					    MQTT_PROTOCOL_VERSION_v311, false);
+				}
+				work->state = WAIT;
+				nng_aio_finish(work->aio, 0);
+			} else {
+				// free Conn_param once more in case invalid
+				// last-will msg
+				conn_param_free(work->cparam);
+				if (work->msg != NULL)
+					nng_msg_free(work->msg);
+				work->msg   = NULL;
+				work->state = RECV;
+				if (work->proto == PROTO_MQTT_BROKER) {
+					nng_ctx_recv(work->ctx, work->aio);
+				} else {
+					nng_ctx_recv(
+					    work->extra_ctx, work->aio);
+				}
+			}
+		}
+		conn_param_free(work->cparam);
+		break;
+	case CLOSE:
+		log_debug(" CLOSE ^^^^ ctx%d ^^^^", work->ctx.id);
+		smsg = nano_dismsg_composer(work->code, NULL, NULL, NULL);
+		nng_msg_free(work->msg);
+		work->msg = smsg;
+		// compose a disconnect msg
+		nng_aio_set_prov_data(work->aio, &work->pid.id);
+		// clone for sending connect event notification
+		nng_aio_set_msg(work->aio, work->msg);
+		nng_ctx_send(work->ctx, work->aio);
+
+		// clear reason code
+		work->code  = SUCCESS;
+		work->state = RECV;
+		nng_ctx_recv(work->ctx, work->aio);
+		break;
+	default:
+		NANO_NNG_FATAL("bad state!", NNG_ESTATE);
+		break;
+	}
+}
+
+struct vcas_work *
+alloc_vcas_work(nng_socket sock)
+{
+	struct vcas_work *w;
+	int               rv;
+
+	if ((w = nng_alloc(sizeof(*w))) == NULL) {
+		NANO_NNG_FATAL("nng_alloc", NNG_ENOMEM);
+	}
+
+	if ((rv = nng_aio_alloc(&w->aio, vcas_server_cb, w)) != 0) {
+		NANO_NNG_FATAL("nng_aio_alloc", rv);
+	}
+
+	if ((rv = nng_ctx_open(&w->ctx, sock)) != 0) {
+		NANO_NNG_FATAL("nng_ctx_open", rv);
+	}
+
+	w->pipe_ct = nng_alloc(sizeof(struct pipe_content));
+	init_pipe_content(w->pipe_ct);
+
+	w->state = VCAS_INIT;
+
+	return w;
+}
+
+vcas_work *
+vcas_work_init(
+    nng_socket sock, dbtree *db_tree, dbtree *db_tree_ret, conf *config)
+{
+	vcas_work *w = alloc_vcas_work(sock);
+
+	w->db     = db_tree;
+	w->db_ret = db_tree_ret;
+	w->config = config;
+
+	return w;
+}
+
+static dbtree *db     = NULL;
+static dbtree *db_ret = NULL;
 // TODO For HTTP SUB/UNSUB usage
 static struct hashmap_s *cid_table = NULL;
 
@@ -1012,14 +1847,15 @@ get_broker_db(void)
 int
 broker(conf *nanomq_conf)
 {
-	int        rv, i;
-	uint64_t   num_work;
-	nng_socket sock;
+	int         rv, i;
+	uint64_t    num_work;
+	nng_socket  sock;
 	nng_socket *bridge_sock;
+	nng_socket  vcas_sock;
 	// add the num of other proto
-	nanomq_conf->total_ctx = nanomq_conf->parallel;		// match with num of aio
-	num_work = nanomq_conf->parallel;					// match with num of works
-
+	nanomq_conf->total_ctx =
+	    nanomq_conf->parallel;        // match with num of aio
+	num_work = nanomq_conf->parallel; // match with num of works
 
 #if defined(SUPP_RULE_ENGINE)
 	conf_rule *cr = &nanomq_conf->rule_eng;
@@ -1051,14 +1887,13 @@ broker(conf *nanomq_conf)
 #if defined(FDB_SUPPORT)
 	if (cr->option & RULE_ENG_FDB) {
 		pthread_t   netThread;
-		fdb_error_t err =
-		    fdb_select_api_version(FDB_API_VERSION);
+		fdb_error_t err = fdb_select_api_version(FDB_API_VERSION);
 		if (err) {
 			log_debug("select API version error: %s",
 			    fdb_get_error(err));
 			exit(1);
 		}
-		FDBDatabase *fdb   = openDatabase(&netThread);
+		FDBDatabase *fdb             = openDatabase(&netThread);
 		nanomq_conf->rule_eng.rdb[1] = (void *) fdb;
 	}
 #endif
@@ -1066,12 +1901,11 @@ broker(conf *nanomq_conf)
 	if (cr->option & RULE_ENG_RPB) {
 		for (int i = 0; i < cvector_size(cr->rules); i++) {
 			if (RULE_FORWORD_REPUB == cr->rules[i].forword_type) {
-				int              index = 0;
+				int         index = 0;
 				nng_socket *sock  = (nng_socket *) nng_alloc(
-				    sizeof(nng_socket));
+                                    sizeof(nng_socket));
 				nano_client(sock, cr->rules[i].repub);
 			}
-
 		}
 	}
 #endif
@@ -1096,9 +1930,19 @@ broker(conf *nanomq_conf)
 	sock.id              = 0;
 	sock.data            = nanomq_conf;
 	rv                   = nng_nmq_tcp0_open(&sock);
+
 	if (rv != 0) {
 		NANO_NNG_FATAL("nng_nmq_tcp0_open", rv);
 	}
+
+	if (nanomq_conf->vcas.enable) {
+		rv = nng_vcas_open(&vcas_sock);
+
+		if (rv != 0) {
+			NANO_NNG_FATAL("nng_nmq_tcp0_open", rv);
+		}
+	}
+
 	log_debug("listener init finished");
 
 	// HTTP Service
@@ -1136,8 +1980,10 @@ broker(conf *nanomq_conf)
 		if ((rv = nng_exchange_client_open(node->sock)) != 0) {
 			log_error("nng_exchange_client_open failed %d", rv);
 		} else {
-			// nng_socket_set_ms(*node->sock, NNG_OPT_RECVMAXSZ, 0xFFFFFFFFu);
-			nng_socket_set_ptr(*node->sock, NNG_OPT_EXCHANGE_BIND, (void *)node);
+			// nng_socket_set_ms(*node->sock, NNG_OPT_RECVMAXSZ,
+			// 0xFFFFFFFFu);
+			nng_socket_set_ptr(
+			    *node->sock, NNG_OPT_EXCHANGE_BIND, (void *) node);
 		}
 		log_debug("exchange %d init finished!\n", i);
 	}
@@ -1172,11 +2018,12 @@ broker(conf *nanomq_conf)
 	if (nanomq_conf->bridge_mode) {
 		for (size_t t = 0; t < nanomq_conf->bridge.count; t++) {
 			conf_bridge_node *node = nanomq_conf->bridge.nodes[t];
-			node->sock = (nng_socket *) nng_alloc(
-				sizeof(nng_socket));
+			node->sock =
+			    (nng_socket *) nng_alloc(sizeof(nng_socket));
 #if defined(SUPP_QUIC)
 			if (node->hybrid) {
-				hybrid_bridge_client(node->sock, nanomq_conf, node);
+				hybrid_bridge_client(
+				    node->sock, nanomq_conf, node);
 			} else {
 				bridge_client(node->sock, nanomq_conf, node);
 			}
@@ -1194,6 +2041,18 @@ broker(conf *nanomq_conf)
 		    PROTO_MQTT_BROKER, db, db_ret, nanomq_conf);
 	}
 
+	struct vcas_work **vcas_works = NULL;
+
+	if (nanomq_conf->vcas.enable) {
+		// CTX for VCAS Broker service
+		vcas_works = nng_zalloc(num_work * sizeof(struct work *));
+
+		for (i = 0; i < nanomq_conf->parallel; i++) {
+			vcas_works[i] =
+			    vcas_work_init(sock, db, db_ret, nanomq_conf);
+		}
+	}
+
 	// create bridge ctx
 	// only create ctx when there is sub topics
 	size_t tmp = nanomq_conf->parallel;
@@ -1202,11 +2061,11 @@ broker(conf *nanomq_conf)
 		// iterates all bridge targets
 		for (size_t t = 0; t < nanomq_conf->bridge.count; t++) {
 			conf_bridge_node *node = nanomq_conf->bridge.nodes[t];
-			bridge_sock = node->sock;
+			bridge_sock            = node->sock;
 			for (i = tmp; i < (tmp + node->parallel); i++) {
-				works[i] = proto_work_init(sock,
-					*bridge_sock, PROTO_MQTT_BRIDGE,
-					db, db_ret, nanomq_conf);
+				works[i] = proto_work_init(sock, *bridge_sock,
+				    PROTO_MQTT_BRIDGE, db, db_ret,
+				    nanomq_conf);
 				works[i]->node = node;
 			}
 			tmp += node->parallel;
@@ -1214,11 +2073,11 @@ broker(conf *nanomq_conf)
 
 #if defined(SUPP_AWS_BRIDGE)
 		for (size_t t = 0; t < nanomq_conf->aws_bridge.count; t++) {
-			conf_bridge_node *node = nanomq_conf->aws_bridge.nodes[t];
+			conf_bridge_node *node =
+			    nanomq_conf->aws_bridge.nodes[t];
 			for (i = tmp; i < (tmp + node->parallel); i++) {
-				works[i] =
-					proto_work_init(sock, inproc_sock,
-						PROTO_AWS_BRIDGE, db, db_ret, nanomq_conf);
+				works[i] = proto_work_init(sock, inproc_sock,
+				    PROTO_AWS_BRIDGE, db, db_ret, nanomq_conf);
 			}
 			tmp += node->parallel;
 			aws_bridge_client(node);
@@ -1237,20 +2096,20 @@ broker(conf *nanomq_conf)
 	}
 
 #if defined(SUPP_ICEORYX)
-	nng_socket iceoryx_sock;
-	const char *iceoryx_service = "NanoMQ-Service";
-	const char *iceoryx_instance = "NanoMQ-Instance";
+	nng_socket  iceoryx_sock;
+	const char *iceoryx_service   = "NanoMQ-Service";
+	const char *iceoryx_instance  = "NanoMQ-Instance";
 	const char *iceoryx_event_sub = "topic";
 	const char *iceoryx_event_pub = "ice/fwd";
 	nng_iceoryx_open(&iceoryx_sock, "NanoMQ-Iceoryx");
 
 	nng_iceoryx_suber *suber;
-	nng_iceoryx_sub(&iceoryx_sock, "NanoMQ-Iceoryx-Suber",
-		iceoryx_service, iceoryx_instance, iceoryx_event_sub, &suber);
+	nng_iceoryx_sub(&iceoryx_sock, "NanoMQ-Iceoryx-Suber", iceoryx_service,
+	    iceoryx_instance, iceoryx_event_sub, &suber);
 
 	nng_iceoryx_puber *puber;
-	nng_iceoryx_pub(&iceoryx_sock, "NanoMQ-Iceoryx-Puber",
-		iceoryx_service, iceoryx_instance, iceoryx_event_pub, &puber);
+	nng_iceoryx_pub(&iceoryx_sock, "NanoMQ-Iceoryx-Puber", iceoryx_service,
+	    iceoryx_instance, iceoryx_event_pub, &puber);
 
 	// create iceoryx ctx
 	log_debug("iceoryx context init");
@@ -1267,20 +2126,28 @@ broker(conf *nanomq_conf)
 		// create exchange senders in hook
 		hook_exchange_sender_init(nanomq_conf, works, num_work);
 		for (i = 0; i < nanomq_conf->exchange.count; i++) {
-			nng_socket *mq_sock = nanomq_conf->exchange.nodes[i]->sock;
+			nng_socket *mq_sock =
+			    nanomq_conf->exchange.nodes[i]->sock;
 			nng_listener mq_listener;
-			if (nanomq_conf->exchange.nodes[i]->exchange_url == NULL ||
-				strlen(nanomq_conf->exchange.nodes[i]->exchange_url) == 0) {
+			if (nanomq_conf->exchange.nodes[i]->exchange_url ==
+			        NULL ||
+			    strlen(nanomq_conf->exchange.nodes[i]
+			            ->exchange_url) == 0) {
 				log_error("Exchange url is not set");
-			} else if ((rv = nano_listen(*mq_sock, nanomq_conf->exchange.nodes[i]->exchange_url, &mq_listener, 0, nanomq_conf)) != 0) {
+			} else if ((rv = nano_listen(*mq_sock,
+			                nanomq_conf->exchange.nodes[i]
+			                    ->exchange_url,
+			                &mq_listener, 0, nanomq_conf)) != 0) {
 				NANO_NNG_FATAL("broker nng_listen", rv);
 			}
-			nng_listener_set_size(mq_listener, NNG_OPT_RECVMAXSZ, 0xFFFFFFFFu);
+			nng_listener_set_size(
+			    mq_listener, NNG_OPT_RECVMAXSZ, 0xFFFFFFFFu);
 		}
 	}
 
 	if (nanomq_conf->enable) {
 		if (nanomq_conf->url) {
+			log_info(nanomq_conf->url);
 			if ((rv = nano_listen(sock, nanomq_conf->url, NULL, 0,
 			         nanomq_conf)) != 0) {
 				NANO_NNG_FATAL("broker nng_listen", rv);
@@ -1296,10 +2163,21 @@ broker(conf *nanomq_conf)
 		}
 	}
 
+	if (nanomq_conf->vcas.enable) {
+		if (nanomq_conf->vcas.bind) {
+			log_info(nanomq_conf->vcas.bind);
+			if ((rv = vcas_listen(vcas_sock,
+			         nanomq_conf->vcas.bind, NULL, 0,
+			         nanomq_conf)) != 0) {
+				NANO_NNG_FATAL("vcas nng_listen", rv);
+			}
+		}
+	}
+
 	// read from command line & config file
 	if (nanomq_conf->websocket.enable) {
-		if ((rv = nano_listen(
-		         sock, nanomq_conf->websocket.url, NULL, 0, nanomq_conf)) != 0) {
+		if ((rv = nano_listen(sock, nanomq_conf->websocket.url, NULL,
+		         0, nanomq_conf)) != 0) {
 			NANO_NNG_FATAL("nng_listen ws", rv);
 		}
 	}
@@ -1345,8 +2223,8 @@ broker(conf *nanomq_conf)
 			         nanomq_conf->websocket.tls_url)) != 0) {
 				NANO_NNG_FATAL("nng_listener_create wss", rv);
 			}
-			nng_listener_set(
-					wss_listener, NANO_CONF, nanomq_conf, sizeof(nanomq_conf));
+			nng_listener_set(wss_listener, NANO_CONF, nanomq_conf,
+			    sizeof(nanomq_conf));
 
 			init_listener_tls(wss_listener, &nanomq_conf->tls);
 			if ((rv = nng_listener_start(wss_listener, 0)) != 0) {
@@ -1364,10 +2242,10 @@ broker(conf *nanomq_conf)
 
 #if defined(SUPP_ICEORYX)
 	for (i = 0; i < num_work; i++) {
-		works[i]->iceoryx_suber = suber;
-		works[i]->iceoryx_puber = puber;
-		works[i]->iceoryx_sock.data  = iceoryx_sock.data;
-		works[i]->iceoryx_sock.id    = iceoryx_sock.id;
+		works[i]->iceoryx_suber     = suber;
+		works[i]->iceoryx_puber     = puber;
+		works[i]->iceoryx_sock.data = iceoryx_sock.data;
+		works[i]->iceoryx_sock.id   = iceoryx_sock.id;
 	}
 #endif
 
@@ -1375,13 +2253,21 @@ broker(conf *nanomq_conf)
 	for (size_t y = 0; y < nanomq_conf->pre_sessions.count; y++) {
 		conf_session_node *node = nanomq_conf->pre_sessions.nodes[y];
 		for (size_t x = 0; x < node->sub_count; x++) {
-			dbtree_insert_client(db, node->sub_list[x]->remote_topic, node->idhash);
-			dbhash_insert_topic(node->idhash, node->sub_list[x]->remote_topic, 2);
+			dbtree_insert_client(
+			    db, node->sub_list[x]->remote_topic, node->idhash);
+			dbhash_insert_topic(
+			    node->idhash, node->sub_list[x]->remote_topic, 2);
 		}
 	}
 
 	for (i = 0; i < num_work; i++) {
 		server_cb(works[i]);
+	}
+
+	if (nanomq_conf->vcas.enable) {
+		for (i = 0; i < num_work; i++) {
+			vcas_server_cb(vcas_works[i]);
+		}
 	}
 
 	if (nanomq_conf->http_server.enable) {
@@ -1394,7 +2280,7 @@ broker(conf *nanomq_conf)
 	if (nanomq_conf->ipc_internal) {
 #if !defined(BUILD_APP_LIB)
 		nng_socket cmd_sock;
-		cmd_work * cmd_works[CMD_PROC_PARALLEL];
+		cmd_work  *cmd_works[CMD_PROC_PARALLEL];
 
 		/*  Create the IPC socket for CMD Server. */
 		rv = nng_rep0_open(&cmd_sock);
@@ -1409,7 +2295,8 @@ broker(conf *nanomq_conf)
 		char *cmd_ipc_url = nanomq_conf->hook_ipc_url == NULL
 		    ? CMD_IPC_URL
 		    : nanomq_conf->cmd_ipc_url;
-		char *ipc_path = strstr(cmd_ipc_url, "ipc://") + strlen("ipc://");
+		char *ipc_path =
+		    strstr(cmd_ipc_url, "ipc://") + strlen("ipc://");
 
 		if (nano_file_exists(ipc_path))
 			nng_file_delete(ipc_path);
@@ -1431,7 +2318,8 @@ broker(conf *nanomq_conf)
 	for (i = 0; i < nanomq_conf->plugin.path_sz; i++) {
 		rv = plugin_register(nanomq_conf->plugin.libs[i]->path);
 		if (rv != 0) {
-			log_error("plugin_register error:%s : %d", nanomq_conf->plugin.libs[i]->path, rv);
+			log_error("plugin_register error:%s : %d",
+			    nanomq_conf->plugin.libs[i]->path, rv);
 		}
 	}
 #endif
@@ -1443,21 +2331,23 @@ broker(conf *nanomq_conf)
 	bool is_testing = false;
 #endif
 
-#if (defined DEBUG)  && (defined ASAN)
+#if (defined DEBUG) && (defined ASAN)
 	signal(SIGINT, intHandler);
 #else
 #if !(defined NANO_PLATFORM_WINDOWS)
-	struct sigaction  act;
+	struct sigaction act;
 	i = 0;
 
 	memset(&act, 0, sizeof act);
 	sigemptyset(&act.sa_mask);
 	act.sa_handler = sig_handler;
-	act.sa_flags = 0;
+	act.sa_flags   = 0;
 
 	do {
 		if (sigaction(all_signals[i], &act, NULL)) {
-			fprintf(stderr, "Cannot install signal %d handler: %s.\n", all_signals[i], strerror(errno));
+			fprintf(stderr,
+			    "Cannot install signal %d handler: %s.\n",
+			    all_signals[i], strerror(errno));
 		}
 	} while (all_signals[i++] != SIGTERM);
 #endif
@@ -1482,26 +2372,33 @@ broker(conf *nanomq_conf)
 #endif
 #endif
 			conf *conf = works[0]->config;
-			if(is_testing == true && (conf->bridge.count > 0 || conf->aws_bridge.count > 0)) {
-				// bridge might need more time to response to the resquest
-				nng_msleep(8 * 1000); 
+			if (is_testing == true &&
+			    (conf->bridge.count > 0 ||
+			        conf->aws_bridge.count > 0)) {
+				// bridge might need more time to response to
+				// the resquest
+				nng_msleep(8 * 1000);
 			}
 			for (size_t t = 0; t < conf->bridge.count; t++) {
 				conf_bridge_node *node = conf->bridge.nodes[t];
-				size_t aio_count = conf->total_ctx;
+				size_t            aio_count = conf->total_ctx;
 				for (size_t i = 0; i < aio_count; i++) {
-					nng_aio_finish_error(node->bridge_aio[i], 0);
-					nng_aio_abort(node->bridge_aio[i], NNG_ECLOSED);
+					nng_aio_finish_error(
+					    node->bridge_aio[i], 0);
+					nng_aio_abort(
+					    node->bridge_aio[i], NNG_ECLOSED);
 					nng_aio_free(node->bridge_aio[i]);
 				}
-				nng_free(node->bridge_aio, aio_count * sizeof(nng_aio *));
+				nng_free(node->bridge_aio,
+				    aio_count * sizeof(nng_aio *));
 				// free(node->name);
 				// free(node->address);
 				// free(node->clientid);
 				// nng_free(node, sizeof(conf_bridge_node));
 			}
 			// nng_free(
-			//     conf->bridge.nodes, sizeof(conf_bridge_node **));
+			//     conf->bridge.nodes, sizeof(conf_bridge_node
+			//     **));
 
 			for (size_t i = 0; i < num_work; i++) {
 				nng_free(works[i]->pipe_ct,
@@ -1581,7 +2478,7 @@ print_usage(void)
 	       "user's private PEM-encoded key\n");
 	printf("  --keypass                  String containing the user's "
 	       "password. \r\n                             "
-		   "Only used if the private keyfile is password-protected\n");
+	       "Only used if the private keyfile is password-protected\n");
 	printf("  --verify                   Set verify peer "
 	       "certificate (default: false)\n");
 	printf("  --fail                     Server will fail if the client "
@@ -1601,7 +2498,6 @@ print_usage(void)
 	printf("  --log_syslog  <true|false> Enable/Disable syslog output "
 	       "(default: false)\n");
 #endif
-
 }
 
 int
@@ -1612,9 +2508,9 @@ status_check(int *pid)
 	log_warn("Not support on Windows\n");
 	return -1;
 #else
-	char  *data = NULL;
-	size_t size = 0;
-	char *pid_path = read_env_pid_file();
+	char  *data     = NULL;
+	size_t size     = 0;
+	char  *pid_path = read_env_pid_file();
 	if (pid_path == NULL) {
 		pid_path = nng_strdup(PID_PATH_NAME);
 	}
@@ -1635,7 +2531,7 @@ status_check(int *pid)
 
 			if ((kill(*pid, 0)) == 0) {
 				log_info("there is a running NanoMQ instance "
-				          ": pid [%u]",
+				         ": pid [%u]",
 				    *pid);
 				return 0;
 			}
@@ -1679,7 +2575,7 @@ predicate_url(conf *config, char *url)
 	    strncmp(BROKER_TCP_URL_PREFIX, url,
 	        strlen(BROKER_TCP_URL_PREFIX)) == 0) {
 		FREE_NONULL(config->url);
-		config->url = nng_strdup(url);
+		config->url    = nng_strdup(url);
 		config->enable = true;
 	}
 	if (strncmp(BROKER_NMQ_TCP_TLS_URL_PREFIX, url,
@@ -1696,12 +2592,12 @@ predicate_url(conf *config, char *url)
 		    strncmp(BROKER_WSS_URL_PREFIX, url,
 		        strlen(BROKER_WSS_URL_PREFIX)) == 0) {
 			FREE_NONULL(config->websocket.tls_url);
-			config->tls.enable        = true;
-			config->websocket.tls_url = nng_strdup(url);
+			config->tls.enable           = true;
+			config->websocket.tls_url    = nng_strdup(url);
 			config->websocket.tls_enable = true;
 		} else {
 			FREE_NONULL(config->websocket.url);
-			config->websocket.url = nng_strdup(url);
+			config->websocket.url    = nng_strdup(url);
 			config->websocket.enable = true;
 		}
 	}
@@ -1848,7 +2744,8 @@ broker_parse_opts(int argc, char **argv, conf *config)
 #else
 			fprintf(stderr,
 			    "Syslog is not supported, please make sure you "
-			    "have built nanomq with option '-D ENABLE_SYSLOG=ON' "
+			    "have built nanomq with option '-D "
+			    "ENABLE_SYSLOG=ON' "
 			    ".\n");
 			exit(EXIT_FAILURE);
 #endif
@@ -1919,7 +2816,9 @@ broker_start(int argc, char **argv)
 	rc = file_path_parse(argc, argv, &nanomq_conf->conf_file);
 	if (nanomq_conf->conf_file == NULL) {
 		nanomq_conf->conf_file = CONF_PATH_NAME;
-		printf("Config file is not specified, use default config file: %s\n", nanomq_conf->conf_file);
+		printf("Config file is not specified, use default config "
+		       "file: %s\n",
+		    nanomq_conf->conf_file);
 	}
 
 	if (!rc) {
@@ -1964,9 +2863,9 @@ broker_start(int argc, char **argv)
 	}
 	if (nanomq_conf->tls.enable && nanomq_conf->websocket.tls_enable) {
 		nanomq_conf->websocket.tls_url =
-			nanomq_conf->websocket.tls_url != NULL
-			? nanomq_conf->websocket.tls_url
-			: nng_strdup(CONF_WSS_URL_DEFAULT);
+		    nanomq_conf->websocket.tls_url != NULL
+		    ? nanomq_conf->websocket.tls_url
+		    : nng_strdup(CONF_WSS_URL_DEFAULT);
 	}
 	// Active daemonize
 #ifdef NANO_PLATFORM_WINDOWS
@@ -2002,8 +2901,8 @@ void *
 broker_start_with_conf(void *nmq_conf)
 {
 
-	int rc = 0;
-	int pid = 0;
+	int   rc          = 0;
+	int   pid         = 0;
 	conf *nanomq_conf = nmq_conf;
 
 	if (!status_check(&pid)) {
@@ -2081,7 +2980,7 @@ broker_start_with_conf(void *nmq_conf)
 
 	// TODO: more check for arg nanomq_conf?
 	rc = broker(nanomq_conf);
-	
+
 	broker_start_rc = rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 	return NULL;
 }
@@ -2215,7 +3114,7 @@ broker_reload(int argc, char **argv)
 
 	conf_parse_ver2(nanomq_conf);
 
-	char *msg = encode_client_cmd(nanomq_conf->conf_file, rc);
+	char *msg         = encode_client_cmd(nanomq_conf->conf_file, rc);
 	char *cmd_ipc_url = nanomq_conf->hook_ipc_url == NULL
 	    ? CMD_IPC_URL
 	    : nanomq_conf->cmd_ipc_url;

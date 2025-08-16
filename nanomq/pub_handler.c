@@ -1820,7 +1820,7 @@ decode_pub_message(nano_work *work, uint8_t proto)
 	pub_packet->fixed_header =
 	    *(struct fixed_header *) nng_msg_header(msg);
 	mqtt_get_remaining_length(nng_msg_header(msg), nng_msg_header_len(msg),
-		&pub_packet->fixed_header.remain_len, &used_pos);
+		&pub_packet->fixed_header.remain_len, (uint8_t*)&used_pos);
 
 	log_debug(
 	    "cmd: %d, retain: %d, qos: %d, dup: %d, remaining length: %d",
