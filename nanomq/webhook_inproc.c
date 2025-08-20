@@ -27,7 +27,7 @@
 
 #include "nng/mqtt/mqtt_client.h"
 
-#ifdef SUPP_PARQUET
+#if defined(SUPP_PARQUET)
 #include "nng/supplemental/nanolib/parquet.h"
 #endif
 
@@ -650,20 +650,6 @@ skip:
 		NANO_NNG_FATAL("bad state!", NNG_ESTATE);
 		break;
 	}
-}
-
-static nng_msg *
-create_connect_msg()
-{
-	// create a CONNECT message
-	/* CONNECT */
-	nng_msg *connmsg;
-	nng_mqtt_msg_alloc(&connmsg, 0);
-	nng_mqtt_msg_set_packet_type(connmsg, NNG_MQTT_CONNECT);
-	nng_mqtt_msg_set_connect_proto_version(connmsg, 4);
-	nng_mqtt_msg_set_connect_client_id(connmsg, "hook-trigger");
-	nng_mqtt_msg_encode(connmsg);
-	return connmsg;
 }
 
 static void

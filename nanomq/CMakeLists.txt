@@ -22,10 +22,10 @@ endif(DEBUG AND TSAN)
 aux_source_directory(. DIRSRCS)
 
 include_directories(./)
-include_directories(${CMAKE_SOURCE_DIR}/nanomq/include)
-include_directories(${CMAKE_SOURCE_DIR}/nng/include/nng)
+include_directories(${PROJECT_SOURCE_DIR}/include)
+include_directories(${PROJECT_SOURCE_DIR}/../nng/include/nng)
 if(ENABLE_JWT)
-  include_directories(${CMAKE_SOURCE_DIR}/extern/l8w8jwt/include)
+  include_directories(${PROJECT_SOURCE_DIR}/../extern/l8w8jwt/include)
 endif(ENABLE_JWT)
 
 add_subdirectory(apps)
@@ -138,13 +138,17 @@ if (CMAKE_INSTALL_RPATH)
   message("Dynamic link rpath: ${CMAKE_INSTALL_RPATH}")
 endif()
 
+if (NOT WIN32)
+  if (NNG_ENABLE_HTTP)
+    target_link_libraries(nanomq nng m)
+  endif()
+endif()
 
 if(BUILD_STATIC)
   target_link_libraries(nanomq nng -static)
 else()
   target_link_libraries(nanomq nng)
 endif()
-
 
 target_compile_definitions(nanomq PRIVATE -DPARALLEL=${PARALLEL})
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

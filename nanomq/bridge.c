@@ -63,6 +63,8 @@ apply_sqlite_config(
 	nng_mqtt_set_sqlite_conf(opt, config);
 	// init sqlite db
 	nng_mqtt_sqlite_db_init(opt, db_name);
+	// Whether flush qos 0 msg to disk for retrying
+	nng_socket_set_bool(*sock, NNG_OPT_MQTT_RETRY_QOS_0, config->retry_qos_0);
 
 	// set sqlite option pointer to socket
 	return nng_socket_set_ptr(*sock, NNG_OPT_MQTT_SQLITE, opt);
@@ -182,10 +184,12 @@ create_disconnect_msg()
 void
 bridge_downward_msg_coding(nano_work *work)
 {
-	int rv = 0;
-	reason_code result          = SUCCESS;
-	conf_bridge_node *node = work->node;
-	mqtt_string *topic;
+	int               rv     = 0;
+	char             *topic_body;
+	reason_code       result = SUCCESS;
+	conf_bridge_node *node   = work->node;
+	mqtt_string      *topic;
+
 	work->pub_packet = (struct pub_packet_struct *) nng_zalloc(
 	    sizeof(struct pub_packet_struct));
 	work->pid       = nng_msg_get_pipe(work->msg);
@@ -194,59 +198,62 @@ bridge_downward_msg_coding(nano_work *work)
 	work->flag      = nng_msg_cmd_type(work->msg);
 
 	result = decode_pub_message(work, work->proto_ver);
+	topic_body = work->pub_packet->var_header.publish.topic_name.body;
 	if (SUCCESS != result) {
 		log_warn("decode message failed.");
 		return;
 	}
+	if (topic_body == NULL) {
+		log_info("NULL topic found! Topic remaping is not \
+				  compatible with Topic alias!");
+		return;
+	}
 	topic = nng_zalloc(sizeof(*topic));
 	if (topic == NULL || node == NULL) {
-		log_error("");
+		log_error("Mem error!");
 		return;
 	}
-	topic->body = work->pub_packet->var_header.publish.topic_name.body;
+	topic->body = topic_body;
 	topic->len  = work->pub_packet->var_header.publish.topic_name.len;
-	if (topic->body == NULL) {
-		log_warn("NULL topic found! Topic alias or decoding error!");
-		nng_free(topic, sizeof(topic));
-		return;
-	}
 	for (size_t i = 0; i < node->sub_count; i++) {
 		if (node->sub_list[i]->remote_topic == NULL) {
 			continue;
 		}
-		if (topic_filter(node->sub_list[i]->remote_topic, topic->body)) {
+		if (topic_filter(
+		        node->sub_list[i]->remote_topic, topic->body)) {
 			topics *sub_topic = node->sub_list[i];
 			if (sub_topic->local_topic_len != 0) {
 				char *new_topic = generate_repub_topic(
-				    sub_topic, topic->body);
+				    sub_topic, topic->body, true);
 				if (new_topic == NULL) {
-					log_warn("Process local_topic failed! Stay with original.");
+					log_warn("Process local_topic failed! "
+					         "Stay with original.");
 				} else {
 					topic->body = new_topic;
 					topic->len  = strlen(new_topic);
-					rv = NNG_STAT_STRING; //mark it for free
+					rv = NNG_STAT_STRING; // mark it for free
 				}
 			}
 			/* check prefix/suffix */
 			if (sub_topic->prefix != NULL) {
 				char *tmp = topic->body;
 				topic->body =
-					nng_strnins(topic->body, sub_topic->prefix,
-								topic->len, sub_topic->prefix_len);
+				    nng_strnins(topic->body, sub_topic->prefix,
+				        topic->len, sub_topic->prefix_len);
 				topic->len = strlen(topic->body);
 				if (rv == NNG_STAT_STRING)
 					nng_free(tmp, strlen(tmp));
-				rv = NNG_STAT_STRING;	//mark it for free
+				rv = NNG_STAT_STRING; // mark it for free
 			}
 			if (node->sub_list[i]->suffix != NULL) {
 				char *tmp = topic->body;
 				topic->body =
-					nng_strncat(topic->body, sub_topic->suffix,
-								topic->len, sub_topic->suffix_len);
+				    nng_strncat(topic->body, sub_topic->suffix,
+				        topic->len, sub_topic->suffix_len);
 				topic->len = strlen(topic->body);
 				if (rv == NNG_STAT_STRING)
 					nng_free(tmp, strlen(tmp));
-				rv = NNG_STAT_STRING;	//mark it for free
+				rv = NNG_STAT_STRING; // mark it for free
 			}
 			work->pub_packet->fixed_header.retain =
 			    sub_topic->retain == NO_RETAIN
@@ -256,115 +263,35 @@ bridge_downward_msg_coding(nano_work *work)
 			if (rv != 0) {
 				uint32_t plen;
 				uint8_t *payload;
-				nng_strfree(work->pub_packet->var_header.publish.topic_name.body);
-				work->pub_packet->var_header.publish.topic_name.body = topic->body;
-				work->pub_packet->var_header.publish.topic_name.len = topic->len;
-				// due to is_copied design, have to copy publish payload as well
-				payload = nng_mqtt_msg_get_publish_payload(work->msg, &plen);
+				nng_strfree(work->pub_packet->var_header
+				        .publish.topic_name.body);
+				work->pub_packet->var_header.publish.topic_name
+				    .body = topic->body;
+				work->pub_packet->var_header.publish.topic_name
+				    .len = topic->len;
+				// due to is_copied design
+				// have to copy publish payload as well
+				payload = nng_mqtt_msg_get_publish_payload(
+				    work->msg, &plen);
 				// encode msg to replace the old one.
-				nng_mqtt_msg_set_publish_topic(work->msg, topic->body);
-				nng_mqtt_msg_set_publish_topic_len(work->msg, topic->len);
-				nng_mqtt_msg_set_publish_payload(work->msg, payload, plen);
-				if (work->proto_ver == MQTT_VERSION_V311)
+				nng_mqtt_msg_set_publish_topic(
+				    work->msg, topic->body);
+				nng_mqtt_msg_set_publish_topic_len(
+				    work->msg, topic->len);
+				nng_mqtt_msg_set_publish_payload(
+				    work->msg, payload, plen);
+				if (work->proto_ver == MQTT_VERSION_V311) {
 					nng_mqtt_msg_encode(work->msg);
-				else if (work->proto_ver == MQTT_VERSION_V5)
+				} else if (work->proto_ver == MQTT_VERSION_V5) {
 					nng_mqttv5_msg_encode(work->msg);
+				}
+				nng_mqtt_msg_free_publish_buf(work->msg);
 			}
 			nng_free(topic, sizeof(topic));
 			return;
 		}
 	}
 	nng_free(topic, sizeof(topic));
-}
-
-// TODO move to RECV state of PROTO_BRIDGE, however we need to modify original msg
-// duplicate msg
-static inline void
-bridge_handle_topic_sub_reflection(nano_work *work, conf_bridge_node *node)
-{
-	int rv = 0;
-	mqtt_string *topic;
-	topic = nng_zalloc(sizeof(*topic));
-	for (size_t i = 0; i < node->sub_count; i++) {
-		rv = 0;
-		topic->body = work->pub_packet->var_header.publish.topic_name.body;
-		topic->len  = work->pub_packet->var_header.publish.topic_name.len;
-		if (topic->body != NULL && node->sub_list[i]->remote_topic != NULL) {
-			// Reminder: We ignore the overlaping matches. only the very first one prevail
-			// There is no way to know msg comes from which topic if we use overlaped wildcard
-			// unless limit this to MQTT v5 sub id.
-			if (topic_filter(node->sub_list[i]->remote_topic, topic->body)) {
-				topics *sub_topic = node->sub_list[i];
-
-				// No local topic change and keep it as it is if local topic == ""
-				if (sub_topic->local_topic_len != 0) {
-					topic->body = nng_strdup(sub_topic->local_topic);
-					topic->len = strlen(topic->body);
-					rv = NNG_STAT_STRING;
-					if (topic->body == NULL) {
-						log_error("bridge: alloc local_topic failed");
-						nng_free(topic, sizeof(topic));
-						return;
-					}
-				}
-				// TODO replace bridge bool with sub retain bool
-				// nng_mqtt_msg_set_sub_retain_bool(work->msg, true);
-				/* check prefix/suffix */
-				if (node->sub_list[i]->prefix != NULL) {
-					char *tmp = topic->body;
-					topic->body =
-						nng_strnins(topic->body, node->sub_list[i]->prefix,
-									topic->len, node->sub_list[i]->prefix_len);
-					topic->len = strlen(topic->body);
-					if (rv == NNG_STAT_STRING)
-						nng_free(tmp, strlen(tmp));
-					rv = NNG_STAT_STRING;	//mark it for free
-				}
-				if (node->sub_list[i]->suffix != NULL) {
-					char *tmp = topic->body;
-					topic->body =
-						nng_strncat(topic->body, node->sub_list[i]->suffix,
-									topic->len, node->sub_list[i]->suffix_len);
-					topic->len = strlen(topic->body);
-					if (rv == NNG_STAT_STRING)
-						nng_free(tmp, strlen(tmp));
-					rv = NNG_STAT_STRING;	//mark it for free
-				}
-				work->pub_packet->fixed_header.retain =
-				    sub_topic->retain == NO_RETAIN
-				    ? work->pub_packet->fixed_header.retain
-				    : sub_topic->retain;
-				/* release old topic area */
-				if (rv != 0) {
-					nng_strfree(work->pub_packet->var_header.publish.topic_name.body);
-					work->pub_packet->var_header.publish.topic_name.body = topic->body;
-					work->pub_packet->var_header.publish.topic_name.len = topic->len;
-				}
-				nng_free(topic, sizeof(topic));
-				return;
-			}
-		}
-	}
-	nng_free(topic, sizeof(topic));
-	return;
-}
-
-void
-bridge_handle_topic_reflection(nano_work *work, conf_bridge *bridge)
-{
-	// for saving CPU
-	if (work->flag == CMD_PUBLISH) {
-		if (work->node != NULL)
-			bridge_handle_topic_sub_reflection(work, work->node);
-		else
-			for (size_t i = 0; i < bridge->count; i++) {
-				conf_bridge_node *node = bridge->nodes[i];
-				if (node->enable) {
-					bridge_handle_topic_sub_reflection(work, node);
-				}
-			}
-	}
-	return;
 }
 
 nng_msg *
@@ -634,7 +561,7 @@ static int
 hybrid_tcp_client(bridge_param *bridge_arg)
 {
 	int           rv;
-	nng_dialer    *dialer = (nng_dialer *) nng_alloc(sizeof(nng_dialer));
+	nng_dialer    *dialer = (nng_dialer *) nng_zalloc(sizeof(*dialer));;
 
 	nng_socket *new = (nng_socket *) nng_alloc(sizeof(nng_socket));
 	conf_bridge_node *node = bridge_arg->config;
@@ -733,7 +660,7 @@ static int
 hybrid_quic_client(bridge_param *bridge_arg)
 {
 	int           rv;
-	nng_dialer    *dialer = (nng_dialer *) nng_alloc(sizeof(nng_dialer));
+	nng_dialer    *dialer = (nng_dialer *) nng_zalloc(sizeof(*dialer));;
 	log_info("Quic hybrid service start.");
 
 	// always alloc a new sock pointer in hybrid mode
@@ -824,6 +751,10 @@ hybrid_cb(void *arg)
 	bridge_param *bridge_arg = arg;
 	conf_bridge_node *node = bridge_arg->config;
 
+	if (node->hybrid_servers == NULL) {
+		log_error("Wrong hybrid server setting, abort!");
+		return;
+	}
 	int rv = nng_mtx_alloc(&bridge_arg->switch_mtx);
 	if (rv != 0) {
 		NANO_NNG_FATAL("nng_mtx_alloc mem error", rv);
@@ -845,7 +776,7 @@ hybrid_cb(void *arg)
 	}
 	char **addrs = node->hybrid_servers;
 	cvector_insert(addrs, 0, strdup(node->address));
-	int    addrslen = cvector_size(node->hybrid_servers);
+	int    addrslen = cvector_size(addrs);
 	int    idx = -1;
 	for (;;) {
 		// Get next bridge node
@@ -1033,7 +964,7 @@ static int
 bridge_quic_reload(nng_socket *sock, conf *config, conf_bridge_node *node, bridge_param *bridge_arg)
 {
 	int           rv;
-	nng_dialer    *dialer = (nng_dialer *) nng_alloc(sizeof(nng_dialer));
+	nng_dialer    *dialer = (nng_dialer *) nng_zalloc(sizeof(*dialer));;
 
 	if (node->proto_ver == MQTT_PROTOCOL_VERSION_v5) {
 		if ((rv = nng_mqttv5_quic_client_open(sock)) != 0) {
@@ -1091,7 +1022,7 @@ static int
 bridge_quic_client(nng_socket *sock, conf *config, conf_bridge_node *node, bridge_param *bridge_arg)
 {
 	int           rv;
-	nng_dialer    *dialer = (nng_dialer *) nng_alloc(sizeof(nng_dialer));
+	nng_dialer    *dialer = (nng_dialer *) nng_zalloc(sizeof(*dialer));;
 	log_debug("Quic bridge service start.\n");
 
 	if (node->proto_ver == MQTT_PROTOCOL_VERSION_v5) {
@@ -1226,7 +1157,7 @@ static int
 bridge_tcp_reload(nng_socket *sock, conf *config, conf_bridge_node *node, bridge_param *bridge_arg)
 {
 	int           rv;
-	nng_dialer    *dialer = (nng_dialer *) nng_alloc(sizeof(nng_dialer));
+	nng_dialer    *dialer = (nng_dialer *) nng_zalloc(sizeof(*dialer));;
 
 	if (node->proto_ver == MQTT_PROTOCOL_VERSION_v5) {
 		if ((rv = nng_mqttv5_client_open(sock)) != 0) {
@@ -1251,6 +1182,33 @@ bridge_tcp_reload(nng_socket *sock, conf *config, conf_bridge_node *node, bridge
 	nng_duration duration = (nng_duration) node->backoff_max * 1000;
 	nng_dialer_set(*dialer, NNG_OPT_MQTT_RECONNECT_BACKOFF_MAX, &duration, sizeof(nng_duration));
 
+	// Set TCP options as well
+	if (node->tcp.enable) {
+		// set bridge dialer tcp options
+		bool nodelay   = node->tcp.nodelay == 1 ? true : false;
+		bool keepalive = node->tcp.keepalive == 1 ? true : false;
+		nng_dialer_set(
+		    *dialer, NNG_OPT_TCP_NODELAY, &nodelay, sizeof(bool));
+		nng_dialer_set(
+		    *dialer, NNG_OPT_TCP_KEEPALIVE, &keepalive, sizeof(bool));
+		if (node->tcp.bind_interface)
+			nng_dialer_set_string(*dialer,
+			    NNG_OPT_TCP_BINDTODEVICE, node->tcp.bind_interface);
+		if (node->tcp.keepalive == 1) {
+			nng_dialer_set(*dialer, NNG_OPT_TCP_QUICKACK,
+			    &(node->tcp.quickack), sizeof(int));
+			nng_dialer_set(*dialer, NNG_OPT_TCP_KEEPIDLE,
+			    &(node->tcp.keepidle), sizeof(int));
+			nng_dialer_set(*dialer, NNG_OPT_TCP_KEEPINTVL,
+			    &(node->tcp.keepintvl), sizeof(int));
+			nng_dialer_set(*dialer, NNG_OPT_TCP_KEEPCNT,
+			    &(node->tcp.keepcnt), sizeof(int));
+			nng_dialer_set(*dialer, NNG_OPT_TCP_SENDTIMEO,
+			    &(node->tcp.sendtimeo), sizeof(int));
+			nng_dialer_set(*dialer, NNG_OPT_TCP_RECVTIMEO,
+			    &(node->tcp.recvtimeo), sizeof(int));
+		}
+	}
 
 #ifdef NNG_SUPP_TLS
 	if (node->tls.enable) {
@@ -1328,7 +1286,7 @@ static int
 bridge_tcp_client(nng_socket *sock, conf *config, conf_bridge_node *node, bridge_param *bridge_arg)
 {
 	int           rv;
-	nng_dialer    *dialer = (nng_dialer *) nng_alloc(sizeof(nng_dialer));
+	nng_dialer    *dialer = (nng_dialer *) nng_zalloc(sizeof(*dialer));
 
 	if (node->proto_ver == MQTT_PROTOCOL_VERSION_v5) {
 		if ((rv = nng_mqttv5_client_open(sock)) != 0) {
@@ -1362,6 +1320,9 @@ bridge_tcp_client(nng_socket *sock, conf *config, conf_bridge_node *node, bridge
 		    *dialer, NNG_OPT_TCP_NODELAY, &nodelay, sizeof(bool));
 		nng_dialer_set(
 		    *dialer, NNG_OPT_TCP_KEEPALIVE, &keepalive, sizeof(bool));
+		if (node->tcp.bind_interface)
+			nng_dialer_set_string(*dialer,
+			    NNG_OPT_TCP_BINDTODEVICE, node->tcp.bind_interface);
 		if (node->tcp.keepalive == 1) {
 			nng_dialer_set(*dialer, NNG_OPT_TCP_QUICKACK,
 			    &(node->tcp.quickack), sizeof(int));

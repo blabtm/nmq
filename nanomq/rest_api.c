@@ -1,5 +1,5 @@
 //
-// Copyright 2020 NanoMQ Team, Inc. <jaylin@emqx.io>
+// Copyright 2025 NanoMQ Team, Inc. <jaylin@emqx.io>
 //
 // This software is supplied under the terms of the MIT License, a
 // copy of which should be located in the distribution where this
@@ -18,7 +18,6 @@
 #include "nng/supplemental/nanolib/base64.h"
 #include "nng/supplemental/nanolib/cJSON.h"
 #include "nng/supplemental/nanolib/file.h"
-#include "nng/supplemental/nanolib/hocon.h"
 
 #include "include/rest_api.h"
 #include "include/bridge.h"
@@ -34,6 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #ifdef SUPP_JWT
 #include "l8w8jwt/decode.h"
@@ -223,6 +223,12 @@ static endpoints api_ep[] = {
 	    .descr  = "Batch unsubscribes topics",
 	},
 	{
+	    .path   = "/write_file",
+	    .name   = "overwrite config file",
+	    .method = "POST",
+	    .descr  = "wirte content to specific file path",
+	},
+	{
 	    .path   = "/topic-tree/",
 	    .name   = "list_topic-tree",
 	    .method = "GET",
@@ -307,6 +313,12 @@ static endpoints api_ep[] = {
 	    .descr  = "show broker aws_bridge configuration",
 	},
 	{
+	    .path   = "/get_file",
+	    .name   = "get file content from path",
+	    .method = "GET",
+	    .descr  = "To get config file content",
+	},
+	{
 	    .path   = "/configuration/",
 	    .name   = "set_broker_configuration",
 	    .method = "POST",
@@ -377,12 +389,14 @@ static http_msg post_mqtt_msg(
     http_msg *msg, nng_socket *sock, handle_mqtt_msg_cb cb);
 static http_msg post_mqtt_msg_batch(
     http_msg *msg, nng_socket *sock, handle_mqtt_msg_cb cb);
+
+static http_msg write_file(http_msg *msg);
+static http_msg get_file_content(http_msg *msg, char *path);
 static http_msg get_mqtt_bridge(http_msg *msg, const char *name);
 static http_msg put_mqtt_bridge(http_msg *msg, const char *name);
 static http_msg put_mqtt_bridge_switch(http_msg *msg, const char *name);
 static http_msg post_mqtt_bridge_sub(http_msg *msg, const char *name);
 static http_msg post_mqtt_bridge_unsub(http_msg *msg, const char *name);
-
 static int properties_parse(property **properties, cJSON *json);
 static int handle_publish_msg(cJSON *pub_obj, nng_socket *sock);
 static int handle_subscribe_msg(cJSON *sub_obj, nng_socket *sock);
@@ -659,6 +673,7 @@ destory_http_msg(http_msg *msg)
 	if (msg->uri_len > 0) {
 		nng_strfree(msg->uri);
 		msg->uri_len = 0;
+		msg->uri = NULL;
 	}
 }
 
@@ -784,6 +799,51 @@ basic_authorize(http_msg *msg)
 	return result;
 }
 
+static
+int HexadecimalToDecimal(char* hex, int len)
+{
+	int hexLength = len;
+	double dec = 0;
+
+	for (int i = 0; i < hexLength; ++i)
+	{
+		char b = hex[i];
+
+		if (b >= 48 && b <= 57)
+			b -= 48;
+		else if (b >= 65 && b <= 70)
+			b -= 55;
+
+		dec += b * pow(16, ((hexLength - i) - 1));
+	}
+
+	return (int)dec;
+}
+
+static
+char* URLDecoding(char* data, unsigned int count) {
+	char* result = nng_zalloc(count);
+	int j = 0;
+
+	for (int i = 0; i < count; ++i, ++j)
+	{
+		if (data[i] == '%')
+		{
+			char h[] = { data[i + 1], data[i + 2] };
+			result[j] = (char)HexadecimalToDecimal(h, 2);
+			i += 2;
+		}
+		else
+		{
+			result[j] = data[i];
+		}
+	}
+
+	result[j] = '\0';
+
+	return result;
+}
+
 http_msg
 process_request(http_msg *msg, conf_http_server *hconfig, nng_socket *sock)
 {
@@ -808,7 +868,8 @@ process_request(http_msg *msg, conf_http_server *hconfig, nng_socket *sock)
 	default:
 		break;
 	}
-
+	if (msg->uri == NULL)	//Probably due to HTTP resend
+		goto exit;
 	uri_ct = uri_parse(msg->uri);
 	if (nng_strcasecmp(msg->method, "GET") == 0) {
 		if (uri_ct->sub_count == 0) {
@@ -859,7 +920,6 @@ process_request(http_msg *msg, conf_http_server *hconfig, nng_socket *sock)
 		    strcmp(uri_ct->sub_tree[1]->node, "subscriptions") == 0) {
 			ret = get_subscriptions(msg, uri_ct->params,
 			    uri_ct->params_count, uri_ct->sub_tree[2]->node);
-
 		} else if (uri_ct->sub_count == 2 &&
 		    uri_ct->sub_tree[1]->end &&
 		    strcmp(uri_ct->sub_tree[1]->node, "rules") == 0) {
@@ -870,7 +930,6 @@ process_request(http_msg *msg, conf_http_server *hconfig, nng_socket *sock)
 		    strcmp(uri_ct->sub_tree[1]->node, "rules") == 0) {
 			ret = get_rules(msg, uri_ct->params,
 			    uri_ct->params_count, uri_ct->sub_tree[2]->node);
-
 		} else if (uri_ct->sub_count == 2 &&
 		    uri_ct->sub_tree[1]->end &&
 		    strcmp(uri_ct->sub_tree[1]->node, "topic-tree") == 0) {
@@ -895,6 +954,26 @@ process_request(http_msg *msg, conf_http_server *hconfig, nng_socket *sock)
 		    uri_ct->sub_tree[2]->end &&
 		    strcmp(uri_ct->sub_tree[1]->node, "bridges") == 0) {
 			ret = get_mqtt_bridge(msg, uri_ct->sub_tree[2]->node);
+		} else if (uri_ct->sub_count == 2 &&
+		    uri_ct->sub_tree[1]->end &&
+		    strcmp(uri_ct->sub_tree[1]->node, "get_file") == 0) {
+			size_t count = 0;
+			while (count < uri_ct->params_count) {
+				if (strcmp(uri_ct->params[count]->key, "default") == 0) {
+					if (strcmp(uri_ct->params[count]->value, "true") == 0) {
+						ret = get_file_content(msg, NULL);
+						break;
+					}
+				} else if (strncmp(uri_ct->params[count]->key, "path", 4) == 0) {
+					size_t path_len = strlen(uri_ct->params[count]->value);
+					char *path = URLDecoding(uri_ct->params[count]->value, path_len);
+					log_debug("decoded path: %s", path);
+					ret = get_file_content(msg, path);
+					nng_free(path, path_len);
+					break;
+				}
+				count ++;
+			}
 		} else {
 			status = NNG_HTTP_STATUS_NOT_FOUND;
 			code   = UNKNOWN_MISTAKE;
@@ -916,6 +995,10 @@ process_request(http_msg *msg, conf_http_server *hconfig, nng_socket *sock)
 		    uri_ct->sub_tree[1]->end &&
 		    strcmp(uri_ct->sub_tree[1]->node, "config_update") == 0) {
 			ret = update_config(msg);
+		} else if (uri_ct->sub_count == 2 &&
+		    uri_ct->sub_tree[1]->end &&
+		    strcmp(uri_ct->sub_tree[1]->node, "write_file") == 0) {
+			ret = write_file(msg);
 		} else if (uri_ct->sub_count == 3 &&
 		    uri_ct->sub_tree[2]->end &&
 		    strcmp(uri_ct->sub_tree[1]->node, "configuration") == 0) {
@@ -932,8 +1015,7 @@ process_request(http_msg *msg, conf_http_server *hconfig, nng_socket *sock)
 		}  else if (uri_ct->sub_count == 4 &&
 		    uri_ct->sub_tree[3]->end &&
 		    strcmp(uri_ct->sub_tree[1]->node, "bridges") == 0 &&
-			strcmp(uri_ct->sub_tree[2]->node, "sub") == 0
-			) {
+			strcmp(uri_ct->sub_tree[2]->node, "sub") == 0) {
 			ret = post_mqtt_bridge_sub(
 			    msg, uri_ct->sub_tree[3]->node);
 		} else if (uri_ct->sub_count == 4 &&
@@ -1639,6 +1721,7 @@ get_metrics(http_msg *msg, kv **params, size_t param_num,
 	cJSON_AddItemToObject(res_obj, "metrics", metrics);
 	cJSON_AddStringToObject(res_obj, "cpuinfo", cpu);
 	cJSON_AddStringToObject(res_obj, "memory", mem);
+	cJSON_AddNumberToObject(res_obj, "connections", nng_atomic_get(config->lc));
 
 	// cJSON *meta = cJSON_CreateObject();
 	// cJSON_AddItemToObject(res_obj, "meta", meta);
@@ -2098,7 +2181,7 @@ post_rules(http_msg *msg)
 			}
 
 #if defined(NNG_SUPP_SQLITE)
-		} else if (!strcasecmp(name, "sqlite")) {
+		} else if (!nng_strcasecmp(name, "sqlite")) {
 			if ((rc = post_rules_sqlite(cr, jso_params, rawsql)) !=
 			    SUCCEED) {
 				goto error;
@@ -2106,21 +2189,21 @@ post_rules(http_msg *msg)
 #endif
 
 #if defined(SUPP_MYSQL)
-		} else if (!strcasecmp(name, "mysql")) {
+		} else if (!nng_strcasecmp(name, "mysql")) {
 			if ((rc = post_rules_mysql(cr, jso_params, rawsql)) !=
 			    SUCCEED) {
 					goto error;
 			}
 #endif
 #if defined(SUPP_POSTGRESQL)
-		} else if (!strcasecmp(name, "postgresql")) {
+		} else if (!nng_strcasecmp(name, "postgresql")) {
 			if ((rc = post_rules_postgresql(cr, jso_params, rawsql)) !=
 			    SUCCEED) {
 					goto error;
 			}
 #endif
 #if defined(SUPP_TIMESCALEDB)
-		} else if (!strcasecmp(name, "timescaledb")) {
+		} else if (!nng_strcasecmp(name, "timescaledb")) {
 			if ((rc = post_rules_timescaledb(cr, jso_params, rawsql)) !=
 			    SUCCEED) {
 					goto error;
@@ -2427,7 +2510,7 @@ put_rules_update_action(cJSON *jso_actions, rule *new_rule, conf_rule *cr)
 				rule_repub_free(repub);
 				return rc;
 			}
-		} else if (!strcasecmp(name, "sqlite")) {
+		} else if (!nng_strcasecmp(name, "sqlite")) {
 			if (new_rule->forword_type != RULE_FORWORD_SQLITE) {
 				log_error("Unsupport change from other type to sqlite");
 				return REQ_PARAM_ERROR;
@@ -2438,7 +2521,7 @@ put_rules_update_action(cJSON *jso_actions, rule *new_rule, conf_rule *cr)
 			if (rc != SUCCEED) {
 				return rc;
 			}
-		} else if (!strcasecmp(name, "mysql")) {
+		} else if (!nng_strcasecmp(name, "mysql")) {
 			if (new_rule->forword_type != RULE_FORWORD_MYSQL) {
 				log_error("Unsupport change from other type to mysql");
 				return REQ_PARAM_ERROR;
@@ -2449,7 +2532,7 @@ put_rules_update_action(cJSON *jso_actions, rule *new_rule, conf_rule *cr)
 				rule_mysql_free(mysql);
 				return rc;
 			}
-		} else if (!strcasecmp(name, "postgresql")) {
+		} else if (!nng_strcasecmp(name, "postgresql")) {
 			if (new_rule->forword_type != RULE_FORWORD_POSTGRESQL) {
 				log_error("Unsupport change from other type to postgresql");
 				return REQ_PARAM_ERROR;
@@ -2460,7 +2543,7 @@ put_rules_update_action(cJSON *jso_actions, rule *new_rule, conf_rule *cr)
 				rule_postgresql_free(postgresql);
 				return rc;
 			}
-		} else if (!strcasecmp(name, "timescaledb")) {
+		} else if (!nng_strcasecmp(name, "timescaledb")) {
 			if (new_rule->forword_type != RULE_FORWORD_TIMESCALEDB) {
 				log_error("Unsupport change from other type to timescaledb");
 				return REQ_PARAM_ERROR;
@@ -2981,14 +3064,71 @@ post_reload_config(http_msg *msg)
 	cJSON_Delete(req);
 	return res;
 }
+// Update sub config file, create one if it is not exist
+static http_msg
+write_file(http_msg *msg)
+{
+	int  		 rv;
+	char *path = NULL, *data;
+	http_msg res = { .status = NNG_HTTP_STATUS_OK };
+	cJSON *req = cJSON_ParseWithLength(msg->data, msg->data_len);
 
+	if (!cJSON_IsObject(req)) {
+		return error_response(msg, NNG_HTTP_STATUS_BAD_REQUEST,
+		    REQ_PARAMS_JSON_FORMAT_ILLEGAL);
+	}
+	conf * config    = get_global_conf();
+	cJSON *conf_data = cJSON_GetObjectItem(req, "data");
+	cJSON *item;
+	getStringValue(conf_data, item, "path", path, rv);
 
+	if (path == NULL) {
+		cJSON_Delete(req);
+		return error_response(msg, NNG_HTTP_STATUS_BAD_REQUEST,
+		    REQ_PARAM_ERROR);
+	}
+	if (!nano_file_exists(path)) {
+		log_warn("Create new file %s! ", path);
+	}
+
+	getStringValue(conf_data, item, "content", data, rv);
+	log_info("config content len %d", strlen(data));
+
+	cJSON *hocon = (cJSON *)nng_hocon_parse_str(data, strlen(data));
+	if (!cJSON_IsObject(hocon)) {
+		cJSON_Delete(req);
+		return error_response(msg, NNG_HTTP_STATUS_BAD_REQUEST,
+		    PARAMS_HOCON_FORMAT_ILLEGAL);
+	}
+
+	log_info("Writting to file %s", path);
+
+	cJSON *res_obj = cJSON_CreateObject();
+	int rc = nng_file_put(path, data, strlen(data));
+	if (0 != rc) {
+		cJSON_AddNumberToObject(res_obj, "code", WRITE_CONFIG_FAILED);
+		log_error("Error writing config to %s, error code: %s", config->conf_file, rc);
+	} else {
+		cJSON_AddNumberToObject(res_obj, "code", SUCCEED);
+	}
+
+	char *dest = cJSON_PrintUnformatted(res_obj);
+	put_http_msg(
+	    &res, "application/json", NULL, NULL, NULL, dest, strlen(dest));
+
+	cJSON_free(dest);
+	cJSON_Delete(res_obj);
+	cJSON_Delete(req);
+	cJSON_Delete(hocon);
+	return res;
+}
+//Update core config file.
 static http_msg
 update_config(http_msg *msg)
 {
 	http_msg res = { .status = NNG_HTTP_STATUS_OK };
 	conf * config    = get_global_conf();
-	cJSON *req = hocon_parse_str(msg->data, msg->data_len);
+	cJSON *req = (cJSON *)nng_hocon_parse_str(msg->data, msg->data_len);
 	if (!cJSON_IsObject(req)) {
 		return error_response(msg, NNG_HTTP_STATUS_BAD_REQUEST,
 		    PARAMS_HOCON_FORMAT_ILLEGAL);
@@ -3709,6 +3849,42 @@ out:
 	    msg, NNG_HTTP_STATUS_BAD_REQUEST, REQ_PARAMS_JSON_FORMAT_ILLEGAL);
 }
 
+// Used for get config file
+static http_msg
+get_file_content(http_msg *msg, char *path)
+{
+	int  		 rv;
+	char 		*data;
+
+	http_msg res = { .status = NNG_HTTP_STATUS_OK };
+
+	if (path == NULL) {
+		conf * config = get_global_conf();
+		path = config->conf_file;
+	}
+	if (!nano_file_exists(path)) {
+		return error_response(
+		    msg, NNG_HTTP_STATUS_GONE, REQ_PARAM_ERROR);
+	}
+	cJSON *file_json = cJSON_CreateObject();
+	file_load_data(path, (void **)&data);
+	cJSON_AddStringOrNullToObject(file_json, "path", path);
+	cJSON_AddStringOrNullToObject(file_json, "content", data);
+
+	cJSON *res_obj = cJSON_CreateObject();
+	cJSON_AddNumberToObject(res_obj, "code", SUCCEED);
+	cJSON_AddItemToObject(res_obj, "data", file_json);
+
+	char *dest = cJSON_PrintUnformatted(res_obj);
+
+	put_http_msg(
+	    &res, "application/json", NULL, NULL, NULL, dest, strlen(dest));
+	cJSON_free(dest);
+	cJSON_Delete(res_obj);
+	nng_free(data, strlen(data));
+	return res;
+}
+
 static http_msg
 get_mqtt_bridge(http_msg *msg, const char *name)
 {
@@ -3761,8 +3937,8 @@ put_mqtt_bridge(http_msg *msg, const char *name)
 			continue;
 		}
 		node->enable = false;
-		nng_dialer_off(*node->dialer);
-		// nng_msleep(100);
+		if (node->dialer != NULL)
+			nng_dialer_off(*node->dialer);
 
 		nng_mtx_lock(node->mtx);
 		conf_bridge_node_destroy(node);	// TODO potential dead lock here!!

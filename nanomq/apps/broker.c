@@ -1,5 +1,5 @@
 //
-// Copyright 2023 NanoMQ Team, Inc. <jaylin@emqx.io>
+// Copyright 2025 NanoMQ Team, Inc. <jaylin@emqx.io>
 //
 // This software is supplied under the terms of the MIT License, a
 // copy of which should be located in the distribution where this
@@ -48,7 +48,9 @@
 #include "include/vcas.h"
 #include "include/web_server.h"
 #include "include/webhook_inproc.h"
-#include "include/webhook_post.h"
+#include "include/cmd_proc.h"
+#include "include/process.h"
+#include "include/version.h"
 
 #if defined(SUPP_ICEORYX)
 #include "nng/iceoryx_shm/iceoryx_shm.h"
@@ -72,6 +74,10 @@
 // descriptors if you set this too high. (If not for that limit, this could
 // be set in the thousands, each context consumes a couple of KB.) Recommend to
 // set as the same as your CPU cores.
+
+#if defined(NANO_PLATFORM_LINUX)
+#include <unistd.h>
+#endif
 
 #if (defined DEBUG) && (defined ASAN)
 int keepRunning = 1;
@@ -199,9 +205,9 @@ static nng_optspec cmd_opts[] = {
 static inline void
 bridge_pub_handler(nano_work *work)
 {
-	int          rv    = 0;
-	property    *props = NULL;
-	uint32_t     index = work->ctx.id - 1;
+	int      rv    = 0;
+	property *props = NULL;
+	uint32_t  index = work->work_id;
 	mqtt_string *topic;
 
 	// Or we just exclude all topic with $?
@@ -217,14 +223,12 @@ bridge_pub_handler(nano_work *work)
 		nng_mtx_lock(node->mtx); // TODO bridge performance
 		if (node->enable) {
 			for (size_t i = 0; i < node->forwards_count; i++) {
-				rv          = 0;
-				topic->body = work->pub_packet->var_header
-				                  .publish.topic_name.body;
-				topic->len = work->pub_packet->var_header
-				                 .publish.topic_name.len;
-				if (topic_filter(
-				        node->forwards_list[i]->local_topic,
-				        (const char *) topic->body)) {
+				rv = 0;
+				topic->body = work->pub_packet->var_header.publish.topic_name.body;
+				topic->len  = work->pub_packet->var_header.publish.topic_name.len;
+				log_debug("local topic %s topic %s", node->forwards_list[i]->local_topic, topic->body);
+				if (topic_filter(node->forwards_list[i]->local_topic,
+							(const char *)topic->body)) {
 					work->state = SEND;
 
 					nng_msg *bridge_msg = NULL;
@@ -237,15 +241,19 @@ bridge_pub_handler(nano_work *work)
 						        ->var_header.publish
 						        .properties);
 					}
-					// No change if remote topic == ""
-					if (node->forwards_list[i]
-					        ->remote_topic_len != 0) {
+					char *new_topic = generate_repub_topic(
+					    node->forwards_list[i],
+					    topic->body, false);
+					topic->body = new_topic;
+					topic->len  = strlen(new_topic);
+					rv = NNG_STAT_STRING;
+					if (node->forwards_list[i]->prefix != NULL) {
 						topic->body =
-						    node->forwards_list[i]
-						        ->remote_topic;
-						topic->len =
-						    node->forwards_list[i]
-						        ->remote_topic_len;
+							nng_strnins(topic->body, node->forwards_list[i]->prefix,
+										topic->len, node->forwards_list[i]->prefix_len);
+						topic->len = strlen(topic->body);
+						rv = NNG_STAT_STRING;	//mark it for free
+						nng_free(new_topic, strlen(new_topic));
 					}
 					if (node->forwards_list[i]->prefix !=
 					    NULL) {
@@ -283,16 +291,11 @@ bridge_pub_handler(nano_work *work)
 					}
 					uint8_t retain;
 					uint8_t qos;
-					retain =
-					    node->forwards_list[i]->retain ==
-					        NO_RETAIN
-					    ? work->pub_packet->fixed_header
-					          .retain
+					retain = node->forwards_list[i]->retain == NO_RETAIN
+					    ? work->pub_packet->fixed_header.retain
 					    : node->forwards_list[i]->retain;
-					qos = node->forwards_list[i]->qos ==
-					        NO_QOS
-					    ? work->pub_packet->fixed_header
-					          .qos
+					qos = node->forwards_list[i]->qos == NO_QOS
+					    ? work->pub_packet->fixed_header.qos
 					    : node->forwards_list[i]->qos;
 					bridge_msg = bridge_publish_msg(
 					    topic->body,
@@ -396,7 +399,7 @@ server_cb(void *arg)
 		log_debug("RECV  ^^^^ ctx%d ^^^^\n", work->ctx.id);
 		msg = nng_aio_get_msg(work->aio);
 		if ((rv = nng_aio_result(work->aio)) != 0) {
-			log_info("RECV aio result: %d", rv);
+			log_debug("RECV aio result: %d", rv);
 			work->state = RECV;
 			if (work->proto == PROTO_MQTT_BROKER) {
 				if (msg != NULL)
@@ -418,7 +421,7 @@ server_cb(void *arg)
 		if (work->proto == PROTO_MQTT_BRIDGE) {
 			uint8_t type = nng_msg_get_type(msg);
 			if (type == CMD_CONNACK) {
-				log_info("bridge client is connected!");
+				log_debug("bridge client is connected!");
 			} else if (type == CMD_PUBLISH) {
 				if (rv == 0) {
 					// only re-coding normal bridigng msg
@@ -426,6 +429,7 @@ server_cb(void *arg)
 					bridge_downward_msg_coding(work);
 				} else {
 					// exclude disconnet event msg
+					log_debug("bridge client is disconnected!");
 				}
 			} else {
 				// only accept publish/CONNACK/DISCONNECT
@@ -533,25 +537,13 @@ server_cb(void *arg)
 				            work->msg_ret[i]));
 				    i++) {
 					nng_msg *m = work->msg_ret[i];
-					work->msg  = m;
-					work->pub_packet =
-					    (struct pub_packet_struct *)
-					        nng_zalloc(sizeof(
-					            struct pub_packet_struct));
-					void   *proto_data = NULL;
-					uint8_t ver =
-					    nng_mqtt_msg_get_publish_proto_version(
-					        work->msg);
-					// ver = ver == 0 ? work->proto_ver :
-					// ver;
-					if (SUCCESS ==
-					    decode_pub_message(work, ver)) {
-						bool bridged = false;
-						proto_data =
-						    nng_msg_get_proto_data(
-						        work->msg);
-						// we simply change the msg
-						// itself
+					work->msg = m;
+					work->pub_packet = (struct pub_packet_struct *) nng_zalloc(
+										sizeof(struct pub_packet_struct));
+					uint8_t ver = nng_mqtt_msg_get_publish_proto_version(work->msg);
+					// ver = ver == 0 ? work->proto_ver : ver;
+					if (SUCCESS == decode_pub_message(work, ver)) {
+						// we simply change the msg itself
 						nng_msg *rmsg = NULL;
 						if (nng_msg_dup(&rmsg,
 						        work->msg) != 0) {
@@ -719,8 +711,7 @@ server_cb(void *arg)
 			}
 			// bridge's will msg only valid at remote
 			if (work->proto != PROTO_MQTT_BRIDGE) {
-				if (conn_param_get_will_flag(work->cparam) ==
-				        0 ||
+				if (conn_param_get_will_flag(work->cparam) == 0 ||
 				    !conn_param_get_will_topic(work->cparam) ||
 				    !conn_param_get_will_msg(work->cparam)) {
 					// no will msg - free the cp
@@ -810,7 +801,7 @@ server_cb(void *arg)
 			iceoryx_opt = 1;
 #endif
 			if (hook_conf->enable || exge_conf->count > 0 ||
-			    rule_opt != RULE_ENG_OFF || iceoryx_opt == 1) {
+			        rule_opt != RULE_ENG_OFF || iceoryx_opt == 1) {
 				work->state = SEND;
 				nng_aio_finish(work->aio, 0);
 				break;
@@ -2039,6 +2030,7 @@ broker(conf *nanomq_conf)
 	for (i = 0; i < nanomq_conf->parallel; i++) {
 		works[i] = proto_work_init(sock, inproc_sock,
 		    PROTO_MQTT_BROKER, db, db_ret, nanomq_conf);
+		works[i]->work_id = i;  //assign id to work
 	}
 
 	struct vcas_work **vcas_works = NULL;
@@ -2067,6 +2059,7 @@ broker(conf *nanomq_conf)
 				    PROTO_MQTT_BRIDGE, db, db_ret,
 				    nanomq_conf);
 				works[i]->node = node;
+				works[i]->work_id = i;  //assign id to work
 			}
 			tmp += node->parallel;
 		}
@@ -2076,23 +2069,15 @@ broker(conf *nanomq_conf)
 			conf_bridge_node *node =
 			    nanomq_conf->aws_bridge.nodes[t];
 			for (i = tmp; i < (tmp + node->parallel); i++) {
-				works[i] = proto_work_init(sock, inproc_sock,
-				    PROTO_AWS_BRIDGE, db, db_ret, nanomq_conf);
+				works[i] =
+					proto_work_init(sock, inproc_sock,
+						PROTO_AWS_BRIDGE, db, db_ret, nanomq_conf);
+				works[i]->work_id = i;  //assign id to work
 			}
 			tmp += node->parallel;
 			aws_bridge_client(node);
 		}
 #endif
-	}
-
-	// create http server ctx
-	if (nanomq_conf->http_server.enable) {
-		log_debug("http context init");
-		for (i = tmp; i < tmp + HTTP_CTX_NUM; i++) {
-			works[i] = proto_work_init(sock, inproc_sock,
-			    PROTO_HTTP_SERVER, db, db_ret, nanomq_conf);
-		}
-		tmp += HTTP_CTX_NUM;
 	}
 
 #if defined(SUPP_ICEORYX)
@@ -2116,11 +2101,23 @@ broker(conf *nanomq_conf)
 	for (i = tmp; i < tmp + HTTP_CTX_NUM; i++) {
 		works[i] = proto_work_init(sock, iceoryx_sock,
 		    PROTO_ICEORYX_BRIDGE, db, db_ret, nanomq_conf);
+		works[i]->work_id = i;  //assign id to work
 	}
 	tmp += HTTP_CTX_NUM;
 #endif
 
-	// Init exchange part in hook
+	// create http server ctx
+	if (nanomq_conf->http_server.enable) {
+		log_debug("http context init");
+		for (i = tmp; i < tmp + HTTP_CTX_NUM; i++) {
+			works[i] = proto_work_init(sock, inproc_sock,
+			    PROTO_HTTP_SERVER, db, db_ret, nanomq_conf);
+			works[i]->work_id = i;  //assign id to work
+		}
+		tmp += HTTP_CTX_NUM;
+	}
+#if defined(SUPP_PARQUET)
+	// Init exchange part in hook, all input CTX must be inited now.
 	if (nanomq_conf->exchange.count > 0) {
 		hook_exchange_init(nanomq_conf, num_work);
 		// create exchange senders in hook
@@ -2144,7 +2141,7 @@ broker(conf *nanomq_conf)
 			    mq_listener, NNG_OPT_RECVMAXSZ, 0xFFFFFFFFu);
 		}
 	}
-
+#endif
 	if (nanomq_conf->enable) {
 		if (nanomq_conf->url) {
 			log_info(nanomq_conf->url);
@@ -2272,7 +2269,13 @@ broker(conf *nanomq_conf)
 
 	if (nanomq_conf->http_server.enable) {
 		nanomq_conf->http_server.broker_sock = &sock;
-		start_rest_server(nanomq_conf);
+		if (start_rest_server(nanomq_conf) == 0) {
+			log_warn("NanoMQ (ver %d.%d.%d) Serving HTTP Server on http://%s:%d",
+					NANO_VER_MAJOR, NANO_VER_MINOR, NANO_VER_PATCH,
+					nanomq_conf->http_server.ip_addr, nanomq_conf->http_server.port);
+		} else {
+			log_error("Start rest server failed!");
+		}
 	}
 
 	// ipc server for receiving commands from reload command
@@ -2372,11 +2375,8 @@ broker(conf *nanomq_conf)
 #endif
 #endif
 			conf *conf = works[0]->config;
-			if (is_testing == true &&
-			    (conf->bridge.count > 0 ||
-			        conf->aws_bridge.count > 0)) {
-				// bridge might need more time to response to
-				// the resquest
+			if(is_testing == true && (conf->bridge.count > 0 || conf->aws_bridge.count > 0)) {
+				// bridge might need more time to response to the resquest
 				nng_msleep(8 * 1000);
 			}
 			for (size_t t = 0; t < conf->bridge.count; t++) {
@@ -2526,12 +2526,12 @@ status_check(int *pid)
 				log_error("read pid from file error!");
 				return 1;
 			}
-			log_info("old pid read, [%u]", *pid);
+			log_debug("old pid read, [%u]", *pid);
 			nng_free(data, size);
 
 			if ((kill(*pid, 0)) == 0) {
-				log_info("there is a running NanoMQ instance "
-				         ": pid [%u]",
+				log_warn("there is a running NanoMQ instance "
+				          ": pid [%u]",
 				    *pid);
 				return 0;
 			}
@@ -2797,12 +2797,13 @@ broker_start(int argc, char **argv)
 
 	conf *nanomq_conf;
 
-	if (!status_check(&pid)) {
-		fprintf(stderr,
-		    "One NanoMQ instance is still running, a new instance "
-		    "won't be started until the other one is stopped.\n");
-		exit(EXIT_FAILURE);
-	}
+	// commented out due to issue #2809
+	// if (!status_check(&pid)) {
+	// 	fprintf(stderr,
+	// 	    "One NanoMQ instance is still running, a new instance "
+	// 	    "won't be started until the other one is stopped.\n");
+	// 	exit(EXIT_FAILURE);
+	// }
 
 	if ((nanomq_conf = nng_zalloc(sizeof(conf))) == NULL) {
 		fprintf(stderr,
@@ -2813,12 +2814,28 @@ broker_start(int argc, char **argv)
 	// Priority: config < environment variables < command opts
 	conf_init(nanomq_conf);
 
+	// Get execute path.
+#if defined(NANO_PLATFORM_LINUX)
+    // if (realpath(argv[0], nanomq_conf->exec_path) == NULL) {
+	ssize_t path_len = readlink("/proc/self/exe", nanomq_conf->exec_path,
+	    sizeof(nanomq_conf->exec_path) - 1);
+	if (path_len <= 0 || path_len >= 512) {
+		fprintf(stderr, "Cannot get exec path or too long! default Config read/write & License Update is not working\n");
+	}
+	printf("path :%s\n", nanomq_conf->exec_path);
+#elif defined(NANO_PLATFORM_WINDOWS)
+#endif
+
 	rc = file_path_parse(argc, argv, &nanomq_conf->conf_file);
-	if (nanomq_conf->conf_file == NULL) {
-		nanomq_conf->conf_file = CONF_PATH_NAME;
-		printf("Config file is not specified, use default config "
-		       "file: %s\n",
-		    nanomq_conf->conf_file);
+	read_env_conf(nanomq_conf);
+	if (nanomq_conf->conf_file == NULL && strlen(nanomq_conf->exec_path) > 7) {
+		char conf_path[512] = {'\0'};
+		memcpy(conf_path, nanomq_conf->exec_path, strlen(nanomq_conf->exec_path) - 7); // only want folder
+		strcat(conf_path, CONF_NAME);
+		nanomq_conf->conf_file = strdup(conf_path);
+		printf("Config file is not specified, using default config file: %s\n", nanomq_conf->conf_file);
+	} else {
+		fprintf(stderr, "Abort finding default config path\n");
 	}
 
 	if (!rc) {
@@ -2831,8 +2848,6 @@ broker_start(int argc, char **argv)
 		// HOCON as default
 		conf_parse_ver2(nanomq_conf);
 	}
-
-	read_env_conf(nanomq_conf);
 
 	if (!broker_parse_opts(argc, argv, nanomq_conf)) {
 		conf_fini(nanomq_conf);

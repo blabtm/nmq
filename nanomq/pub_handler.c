@@ -86,7 +86,7 @@ static void  print_hex(
      const char *prefix, const unsigned char *src, int src_len);
 static uint32_t append_bytes_with_type(
     nng_msg *msg, uint8_t type, uint8_t *content, uint32_t len);
-static void inline handle_pub_retain(const nano_work *work, char *topic);
+static void inline handle_pub_retain(nano_work *work, char *topic);
 
 void
 init_pipe_content(struct pipe_content *pipe_ct)
@@ -1434,13 +1434,6 @@ handle_pub(nano_work *work, struct pipe_content *pipe_ct, uint8_t proto,
 		return TOPIC_FILTER_INVALID;
 	}
 
-#if defined(SUPP_AWS_BRIDGE)
-	if (work->proto == PROTO_AWS_BRIDGE) {
-		bridge_handle_topic_reflection(
-		    work, &work->config->aws_bridge);
-	}
-#endif
-
 	topic = work->pub_packet->var_header.publish.topic_name.body;
 
 #ifdef ACL_SUPP
@@ -1510,7 +1503,7 @@ static void inline handle_pub_retain_sqlite(const nano_work *work, char *topic)
 
 #endif
 
-static void inline handle_pub_retain(const nano_work *work, char *topic)
+static void inline handle_pub_retain(nano_work *work, char *topic)
 {
 #if defined(NNG_SUPP_SQLITE)
 	if (work->config != NULL && work->config->sqlite.enable &&
@@ -1522,20 +1515,17 @@ static void inline handle_pub_retain(const nano_work *work, char *topic)
 	nng_msg *old_ret = NULL, *ret;
 	if (work->pub_packet->fixed_header.retain) {
 		if (work->pub_packet->payload.len > 0) {
-			if (nng_msg_dup(&ret, work->msg) != 0) {
-				log_error("Mem error");
-				return;
-			}
-			if (nng_msg_get_proto_data(ret) == NULL)
-				nng_mqtt_msg_proto_data_alloc(ret);
+			nng_msg_alloc(&ret, 0);
+			nng_mqtt_msg_proto_data_alloc(ret);
+			nng_msg_set_timestamp(ret, nng_clock());
 			if (work->proto_ver == MQTT_PROTOCOL_VERSION_v5) {
-				if (nng_mqttv5_msg_decode(ret) != 0) {
-					log_warn("decode retain msg failed, drop msg");
-					nng_msg_free(ret);
-					return;
-				}
+				nng_msg_set_cmd_type(ret, CMD_PUBLISH_V5);
+				encode_pub_message(ret, work, PUBLISH);
+				// Already decoded in encode_pub_message
 			} else if (work->proto_ver == MQTT_PROTOCOL_VERSION_v311 ||
 					   work->proto_ver == MQTT_PROTOCOL_VERSION_v31) {
+				nng_msg_set_cmd_type(ret, CMD_PUBLISH);
+				encode_pub_message(ret, work, PUBLISH);
 				if (nng_mqtt_msg_decode(ret) != 0) {
 					log_warn("decode retain msg failed, "
 					         "drop msg");
@@ -1627,7 +1617,7 @@ append_bytes_with_type(
 }
 
 /**
- * @brief encode dest_msg with work.
+ * @brief encode dest_msg with work. Decode msg too if is V5
  * @param dest_msg nng_msg
  * @param work nano_work
  * @param cmd mqtt_control_packet_types
@@ -1810,6 +1800,7 @@ decode_pub_message(nano_work *work, uint8_t proto)
 	uint32_t used_pos = 0;
 	uint32_t len, len_of_varint;
 	bool     is_copy = false;
+	uint8_t  remain_used_pos = 0;
 
 	nng_msg                  *msg        = work->msg;
 	struct pub_packet_struct *pub_packet = work->pub_packet;
@@ -1820,7 +1811,7 @@ decode_pub_message(nano_work *work, uint8_t proto)
 	pub_packet->fixed_header =
 	    *(struct fixed_header *) nng_msg_header(msg);
 	mqtt_get_remaining_length(nng_msg_header(msg), nng_msg_header_len(msg),
-		&pub_packet->fixed_header.remain_len, (uint8_t*)&used_pos);
+		&pub_packet->fixed_header.remain_len, &remain_used_pos);
 
 	log_debug(
 	    "cmd: %d, retain: %d, qos: %d, dup: %d, remaining length: %d",
@@ -1828,8 +1819,8 @@ decode_pub_message(nano_work *work, uint8_t proto)
 	    pub_packet->fixed_header.retain, pub_packet->fixed_header.qos,
 	    pub_packet->fixed_header.dup, pub_packet->fixed_header.remain_len);
 
-	if (pub_packet->fixed_header.remain_len > msg_len || used_pos > 4) {
-		log_error("decode remainlen > msg_len");
+	if (pub_packet->fixed_header.remain_len > msg_len || remain_used_pos > 4) {
+		log_error("decode remainlen > msg_len remain_used_pos%d", remain_used_pos);
 		return PROTOCOL_ERROR;
 	}
 	used_pos = 0;
@@ -1840,10 +1831,10 @@ decode_pub_message(nano_work *work, uint8_t proto)
 		// topic length
 		pub_packet->var_header.publish.topic_name.body =
 		    (char *) copyn_utf8_str(msg_body, &pos, (int *) &len, msg_len);
-		if (len >= 0)
+		if (len >= 0) {
 			// topic could be NULL here (topic alias)
 			pub_packet->var_header.publish.topic_name.len = len;
-		else {
+		} else {
 			log_warn("Invalid msg: Protocol error!");
 			return PROTOCOL_ERROR;
 		}
