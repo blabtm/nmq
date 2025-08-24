@@ -50,7 +50,6 @@ set(SOURCES
     cmd_proc.c
     acl_handler.c
     mqtt_api.c
-    vcas_api.c
     nanomq.c
     apps/broker.c
 )

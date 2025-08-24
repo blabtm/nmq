@@ -34,6 +34,7 @@
 .idea/
 .vscode/
 build/
+.cache/
 cmake-build-debug/
 
 .DS_Store

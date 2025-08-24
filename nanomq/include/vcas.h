@@ -27,7 +27,4 @@ typedef struct vcas_work {
 	struct pipe_content *pipe_ct;
 } vcas_work;
 
-int vcas_listen(
-    nng_socket sid, const char *addr, nng_listener *lp, int flags, conf *conf);
-
 #endif // NANOMQ_VCAS_H
